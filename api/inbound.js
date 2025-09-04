@@ -141,7 +141,11 @@ if (text && from) {
   "Thanks for reaching out to Garage Raiders, we’ll follow up shortly.";
 
 // Remove any citation-style tags like  
-reply = reply.replace(/【\d+:\d+†.*?†.*?】/g, '');
+reply = reply
+  .replace(/【\d+:\d+†.*?†.*?】/g, '')  // removes 【…】 style
+  .replace(/\[\d+\]/g, '')             // removes [1], [2] style
+  .replace(/\(source.*?\)/gi, '');     // removes (source …)
+
 
     // 9) Send reply via Twilio + store outbound
     const sent = await twilioClient.messages.create({
