@@ -67,7 +67,14 @@ export default async function handler(req, res) {
       twilio_message_sid: sid
     });
     if (msgErr) throw msgErr;
-
+    // 👇 add this block right after inserting the inbound message
+if (text && from) {
+  await twilioClient.messages.create({
+    from: process.env.TWILIO_FROM_NUMBER, // your Twilio number
+    to: process.env.WIX_ALERT_NUMBER,     // your Wix cell/forwarding number
+    body: `📩 New SMS from ${from}: ${text}`
+  });
+}
     // 4) Ensure we have a thread for this lead
     let threadId = leadRow.thread_id;
     if (!threadId) {
