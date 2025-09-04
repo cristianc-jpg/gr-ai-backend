@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Garage Raiders — Inbox</title>
+  <style>
+    body { margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; background: #0b0b0b; color: #f5f5f5; }
+    .wrap { display: grid; grid-template-columns: 340px 1fr; height: 100vh; }
+    .left { border-right: 1px solid #222; overflow-y: auto; background: #111; }
+    .right { display: grid; grid-template-rows: 1fr auto; }
+    .lead { padding: 14px; border-bottom: 1px solid #1c1c1c; cursor: pointer; }
+    .lead:hover { background: #151515; }
+    .lead .phone { font-weight: 600; }
+    .lead .preview { color: #aaa; font-size: 12px; margin-top: 6px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .header { padding: 14px; border-bottom: 1px solid #222; display: flex; justify-content: space-between; align-items: center; background: #0f0f0f; }
+    .messages { padding: 16px; overflow-y: auto; }
+    .msg { margin: 8px 0; max-width: 70%; padding: 10px 12px; border-radius: 10px; line-height: 1.35; }
+    .in { background: #1b1b1b; }
+    .out { background: #223; }
+    .composer { display: flex; gap: 8px; padding: 12px; border-top: 1px solid #222; background: #0f0f0f; }
+    input, button, textarea { border: 1px solid #333; background: #111; color: #f5f5f5; }
+    textarea { flex: 1; height: 68px; resize: none; border-radius: 8px; padding: 10px; }
+    button { border-radius: 8px; padding: 10px 14px; cursor: pointer; }
+    button:hover { background: #171717; }
+    .muted { color: #9a9a9a; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="left" id="leadList"></div>
+    <div class="right">
+      <div class="header">
+        <div id="leadTitle">Select a lead</div>
+        <div class="muted" id="leadPhone"></div>
+      </div>
+      <div class="messages" id="thread"></div>
+      <div class="composer">
+        <textarea id="replyBox" placeholder="Type a reply…"></textarea>
+        <button id="sendBtn">Send</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const leadList = document.getElementById('leadList');
+    const thread = document.getElementById('thread');
+    const leadTitle = document.getElementById('leadTitle');
+    const leadPhone = document.getElementById('leadPhone');
+    const replyBox = document.getElementById('replyBox');
+    const sendBtn = document.getElementById('sendBtn');
+
+    let currentLead = null;
+
+    async function loadLeads() {
+      const res = await fetch('/api/leads');
+      const data = await res.json();
+      leadList.innerHTML = '';
+      (data.leads || []).forEach(l => {
+        const div = document.createElement('div');
+        div.className = 'lead';
+        div.innerHTML = `
+          <div class="phone">${l.name ? l.name + ' · ' : ''}${l.phone}</div>
+          <div class="preview">${l.last_message || ''}</div>
+        `;
+        div.onclick = () => selectLead(l);
+        leadList.appendChild(div);
+      });
+    }
+
+    async function selectLead(lead) {
+      currentLead = lead;
+      leadTitle.textContent = lead.name || 'Lead';
+      leadPhone.textContent = lead.phone;
+      await loadMessages(lead.id);
+      thread.scrollTop = thread.scrollHeight;
+    }
+
+    async function loadMessages(lead_id) {
+      thread.innerHTML = '';
+      const res = await fetch('/api/messages?lead_id=' + encodeURIComponent(lead_id));
+      const data = await res.json();
+      (data.messages || []).forEach(m => {
+        const b = document.createElement('div');
+        b.className = 'msg ' + (m.direction === 'outbound' ? 'out' : 'in');
+        b.textContent = m.body;
+        thread.appendChild(b);
+      });
+    }
+
+    async function sendReply() {
+      if (!currentLead) { alert('Pick a lead first.'); return; }
+      const to = currentLead.phone;
+      const body = replyBox.value.trim();
+      if (!body) return;
+
+      const res = await fetch('/api/reply', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ to, body })
+      });
+      if (res.ok) {
+        replyBox.value = '';
+        await loadMessages(currentLead.id);
+        thread.scrollTop = thread.scrollHeight;
+      } else {
+        alert('Send failed.');
+      }
+    }
+
+    sendBtn.onclick = sendReply;
+    replyBox.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) sendReply();
+    });
+
+    // initial load + refresh every 15s
+    loadLeads();
+    setInterval(loadLeads, 15000);
+  </script>
+</body>
+</html>
