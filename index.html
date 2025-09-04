@@ -25,6 +25,7 @@
     button:hover { background: #171717; }
     .muted { color: #9a9a9a; font-size: 12px; }
   </style>
+  <script src="https://unpkg.com/@supabase/supabase-js@2"></script>
 </head>
 <body>
   <div class="wrap">
@@ -47,6 +48,14 @@
   preload="auto"></audio>
 
   <script>
+  // ====== CONFIG: paste your own values ======
+  const SUPABASE_URL = "https://ifvuruqymvjcjqafnrkg.supabase.co";
+  const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImlmdnVydXF5bXZqY2pxYWZucmtnIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTY5OTM3MjksImV4cCI6MjA3MjU2OTcyOX0.sieeTiuCenc8Hwapto01tNeCiXdVhjLo9Jb0OC-MYfk";
+
+  // ====== Supabase client (browser-safe) ======
+  const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+  // ====== DOM refs ======
   const leadList = document.getElementById('leadList');
   const thread = document.getElementById('thread');
   const leadTitle = document.getElementById('leadTitle');
@@ -54,9 +63,21 @@
   const replyBox = document.getElementById('replyBox');
   const sendBtn = document.getElementById('sendBtn');
 
+  // ====== State ======
   let currentLead = null;
   let lastSeenMsgId = null;
   let loadedMsgIds = new Set();
+
+  // ====== Helpers ======
+  async function showNotification(title, body) {
+    if (!("Notification" in window)) return;
+    if (Notification.permission === "granted") {
+      new Notification(title, { body });
+    } else if (Notification.permission !== "denied") {
+      const perm = await Notification.requestPermission();
+      if (perm === "granted") new Notification(title, { body });
+    }
+  }
 
   async function loadLeads() {
     const res = await fetch('/api/leads');
@@ -79,6 +100,7 @@
     leadTitle.textContent = lead.name || 'Lead';
     leadPhone.textContent = lead.phone;
     loadedMsgIds.clear();
+    lastSeenMsgId = null;
     thread.innerHTML = '';
     await loadMessages(lead.id);
     thread.scrollTop = thread.scrollHeight;
@@ -99,14 +121,10 @@
       loadedMsgIds.add(m.id);
     });
 
-    // Alert on new inbound message
     if (msgs.length > 0) {
       const newest = msgs[msgs.length - 1];
-      if (lastSeenMsgId && newest.id !== lastSeenMsgId && newest.direction === 'inbound') {
-        document.getElementById('alertSound').play().catch(() => {});
-        alert('📩 New message from ' + currentLead.phone);
-      }
       lastSeenMsgId = newest.id;
+      thread.scrollTop = thread.scrollHeight;
     }
   }
 
@@ -123,7 +141,13 @@
     });
     if (res.ok) {
       replyBox.value = '';
-      await loadMessages(currentLead.id);
+      // The outbound insert will also arrive via Realtime in a moment.
+      // For snappier UX, we can optimistically add it:
+      // (optional)
+      const b = document.createElement('div');
+      b.className = 'msg out';
+      b.textContent = body;
+      thread.appendChild(b);
       thread.scrollTop = thread.scrollHeight;
     } else {
       alert('Send failed.');
@@ -135,18 +159,47 @@
     if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) sendReply();
   });
 
-  // Initial load
+  // ====== Realtime subscription: new messages ======
+  // Make sure Realtime is enabled on the 'messages' table (INSERT).
+  supabase
+    .channel('messages-realtime')
+    .on('postgres_changes',
+      { event: 'INSERT', schema: 'public', table: 'messages' },
+      async (payload) => {
+        const m = payload.new;
+
+        // Update the left lead list preview
+        loadLeads();
+
+        // If we're viewing this lead, append the message live
+        if (currentLead && m.lead_id === currentLead.id) {
+          if (!loadedMsgIds.has(m.id)) {
+            const bubble = document.createElement('div');
+            bubble.className = 'msg ' + (m.direction === 'outbound' ? 'out' : 'in');
+            bubble.textContent = m.body;
+            thread.appendChild(bubble);
+            loadedMsgIds.add(m.id);
+            lastSeenMsgId = m.id;
+            thread.scrollTop = thread.scrollHeight;
+          }
+
+          // Sound + system notification on inbound only
+          if (m.direction === 'inbound') {
+            const audio = document.getElementById('alertSound');
+            if (audio) audio.play().catch(() => {});
+            showNotification('📩 New message from ' + (currentLead.phone || ''), m.body);
+          }
+        }
+      }
+    )
+    .subscribe();
+
+  // ====== Initial load ======
   loadLeads();
 
-  // Refresh every 5s
-  setInterval(() => {
-    loadLeads();
-    if (currentLead) {
-      loadMessages(currentLead.id).then(() => {
-        thread.scrollTop = thread.scrollHeight;
-      });
-    }
-  }, 5000);
+  // (Optional) Light fallback: refresh the lead list every 30s in case the socket drops.
+  setInterval(loadLeads, 30000);
 </script>
+
 </body>
 </html>
