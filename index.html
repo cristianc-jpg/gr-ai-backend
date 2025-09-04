@@ -41,88 +41,112 @@
       </div>
     </div>
   </div>
+  
+<audio id="alertSound" 
+  src="https://actions.google.com/sounds/v1/alarms/beep_short.ogg" 
+  preload="auto"></audio>
 
   <script>
-    const leadList = document.getElementById('leadList');
-    const thread = document.getElementById('thread');
-    const leadTitle = document.getElementById('leadTitle');
-    const leadPhone = document.getElementById('leadPhone');
-    const replyBox = document.getElementById('replyBox');
-    const sendBtn = document.getElementById('sendBtn');
+  const leadList = document.getElementById('leadList');
+  const thread = document.getElementById('thread');
+  const leadTitle = document.getElementById('leadTitle');
+  const leadPhone = document.getElementById('leadPhone');
+  const replyBox = document.getElementById('replyBox');
+  const sendBtn = document.getElementById('sendBtn');
 
-    let currentLead = null;
+  let currentLead = null;
+  let lastSeenMsgId = null;
+  let loadedMsgIds = new Set();
 
-    async function loadLeads() {
-      const res = await fetch('/api/leads');
-      const data = await res.json();
-      leadList.innerHTML = '';
-      (data.leads || []).forEach(l => {
-        const div = document.createElement('div');
-        div.className = 'lead';
-        div.innerHTML = `
-          <div class="phone">${l.name ? l.name + ' · ' : ''}${l.phone}</div>
-          <div class="preview">${l.last_message || ''}</div>
-        `;
-        div.onclick = () => selectLead(l);
-        leadList.appendChild(div);
-      });
-    }
+  async function loadLeads() {
+    const res = await fetch('/api/leads');
+    const data = await res.json();
+    leadList.innerHTML = '';
+    (data.leads || []).forEach(l => {
+      const div = document.createElement('div');
+      div.className = 'lead';
+      div.innerHTML = `
+        <div class="phone">${l.name ? l.name + ' · ' : ''}${l.phone}</div>
+        <div class="preview">${l.last_message || ''}</div>
+      `;
+      div.onclick = () => selectLead(l);
+      leadList.appendChild(div);
+    });
+  }
 
-    async function selectLead(lead) {
-      currentLead = lead;
-      leadTitle.textContent = lead.name || 'Lead';
-      leadPhone.textContent = lead.phone;
-      await loadMessages(lead.id);
-      thread.scrollTop = thread.scrollHeight;
-    }
+  async function selectLead(lead) {
+    currentLead = lead;
+    leadTitle.textContent = lead.name || 'Lead';
+    leadPhone.textContent = lead.phone;
+    loadedMsgIds.clear();
+    thread.innerHTML = '';
+    await loadMessages(lead.id);
+    thread.scrollTop = thread.scrollHeight;
+  }
 
-    async function loadMessages(lead_id) {
-      thread.innerHTML = '';
-      const res = await fetch('/api/messages?lead_id=' + encodeURIComponent(lead_id));
-      const data = await res.json();
-      (data.messages || []).forEach(m => {
-        const b = document.createElement('div');
-        b.className = 'msg ' + (m.direction === 'outbound' ? 'out' : 'in');
-        b.textContent = m.body;
-        thread.appendChild(b);
-      });
-    }
+  async function loadMessages(lead_id) {
+    const res = await fetch('/api/messages?lead_id=' + encodeURIComponent(lead_id));
+    const data = await res.json();
+    const msgs = data.messages || [];
 
-    async function sendReply() {
-      if (!currentLead) { alert('Pick a lead first.'); return; }
-      const to = currentLead.phone;
-      const body = replyBox.value.trim();
-      if (!body) return;
+    msgs.forEach(m => {
+      if (loadedMsgIds.has(m.id)) return; // already shown
 
-      const res = await fetch('/api/reply', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ to, body })
-      });
-      if (res.ok) {
-        replyBox.value = '';
-        await loadMessages(currentLead.id);
-        thread.scrollTop = thread.scrollHeight;
-      } else {
-        alert('Send failed.');
-      }
-    }
-
-    sendBtn.onclick = sendReply;
-    replyBox.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) sendReply();
+      const b = document.createElement('div');
+      b.className = 'msg ' + (m.direction === 'outbound' ? 'out' : 'in');
+      b.textContent = m.body;
+      thread.appendChild(b);
+      loadedMsgIds.add(m.id);
     });
 
-    // Initial load
-loadLeads();
-
-// Refresh every 5s
-setInterval(() => {
-  loadLeads();
-  if (currentLead) {
-    loadMessages(currentLead.id);
+    // Alert on new inbound message
+    if (msgs.length > 0) {
+      const newest = msgs[msgs.length - 1];
+      if (lastSeenMsgId && newest.id !== lastSeenMsgId && newest.direction === 'inbound') {
+        document.getElementById('alertSound').play().catch(() => {});
+        alert('📩 New message from ' + currentLead.phone);
+      }
+      lastSeenMsgId = newest.id;
+    }
   }
-}, 5000);
-  </script>
+
+  async function sendReply() {
+    if (!currentLead) { alert('Pick a lead first.'); return; }
+    const to = currentLead.phone;
+    const body = replyBox.value.trim();
+    if (!body) return;
+
+    const res = await fetch('/api/reply', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ to, body })
+    });
+    if (res.ok) {
+      replyBox.value = '';
+      await loadMessages(currentLead.id);
+      thread.scrollTop = thread.scrollHeight;
+    } else {
+      alert('Send failed.');
+    }
+  }
+
+  sendBtn.onclick = sendReply;
+  replyBox.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) sendReply();
+  });
+
+  // Initial load
+  loadLeads();
+
+  // Refresh every 5s
+  setInterval(() => {
+    loadLeads();
+    if (currentLead) {
+      loadMessages(currentLead.id).then(() => {
+        thread.scrollTop = thread.scrollHeight;
+      });
+    }
+  }, 5000);
+</script>
 </body>
 </html>
