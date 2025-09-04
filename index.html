@@ -113,9 +113,16 @@
       if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) sendReply();
     });
 
-    // initial load + refresh every 15s
-    loadLeads();
-    setInterval(loadLeads, 15000);
+    // Initial load
+loadLeads();
+
+// Refresh every 5s
+setInterval(() => {
+  loadLeads();
+  if (currentLead) {
+    loadMessages(currentLead.id);
+  }
+}, 5000);
   </script>
 </body>
 </html>
