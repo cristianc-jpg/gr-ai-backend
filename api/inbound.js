@@ -137,8 +137,11 @@ if (text && from) {
     const list = await openai(`/threads/${threadId}/messages?order=desc&limit=1`, { method: 'GET' });
     const last = list.data?.[0];
     let reply =
-      last?.content?.[0]?.text?.value ||
-      "Thanks for reaching out to Garage Raiders, we’ll follow up shortly.";
+  last?.content?.[0]?.text?.value ||
+  "Thanks for reaching out to Garage Raiders, we’ll follow up shortly.";
+
+// Remove any citation-style tags like  
+reply = reply.replace(/【\d+:\d+†.*?†.*?】/g, '');
 
     // 9) Send reply via Twilio + store outbound
     const sent = await twilioClient.messages.create({
