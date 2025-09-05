@@ -193,6 +193,15 @@
       }
     )
     .subscribe();
+    // ====== Debug: log every realtime event to console ======
+supabase
+  .channel('debug-messages')
+  .on(
+    'postgres_changes',
+    { event: 'INSERT', schema: 'public', table: 'messages' },
+    payload => console.log('Realtime event:', payload)
+  )
+  .subscribe();
 
   // ====== Initial load ======
   loadLeads();
