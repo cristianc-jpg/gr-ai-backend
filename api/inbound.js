@@ -50,6 +50,11 @@ function normE164(s) {
   return `+${d10}`;
 }
 
+// Helper: determine if stage is already at/after quote
+function isAtOrAfterQuote(stage) {
+  return stage === 'quote_sent' || stage === 'closed_won' || stage === 'closed_lost';
+}
+
 // ---------- main ----------
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
@@ -81,6 +86,7 @@ export default async function handler(req, res) {
     if (upErr) throw upErr;
 
     const leadId = lead.id;
+    const existingStage = lead.stage || null;
 
     // Detect photos (MMS)
     const mediaUrls = [];
@@ -97,20 +103,24 @@ export default async function handler(req, res) {
       body: body || (hasPhotos ? '[Photo(s) received]' : ''),
       channel: 'sms',
       twilio_message_id: sid || null,
+      // If you later add a media_urls jsonb column, you can include it here:
+      // media_urls: hasPhotos ? mediaUrls : null,
     };
-    // If you later add a media_urls jsonb column, include: media_urls: mediaUrls
     const { error: msgErr } = await supa.from('messages').insert(insertPayload);
     if (msgErr) throw msgErr;
 
-    // If photos, move stage and alert owner
+    // Stage updates (idempotent; never downgrade)
     if (hasPhotos) {
-      await supa.from('leads').update({ stage: 'awaiting_owner_quote' }).eq('id', leadId);
+      // Move to awaiting_owner_quote only if not already at/after quote
+      if (!isAtOrAfterQuote(existingStage) && existingStage !== 'awaiting_owner_quote') {
+        await supa.from('leads').update({ stage: 'awaiting_owner_quote' }).eq('id', leadId);
+      }
 
-      // Simple owner alert (SMS). You can replace with a richer internal webhook later.
+      // Owner alert (single path; we only message OWNER_CELL to avoid duplicates)
       if (process.env.OWNER_CELL && process.env.TWILIO_FROM_NUMBER) {
         const count = mediaUrls.length;
         const alertText =
-          `Photos in from ${from} (${count}): ` +
+          `Photos in from ${from} (${count}). ` +
           `Reply with a number 2–8 on the owner line to set hours.`;
         try {
           await twilioClient.messages.create({
@@ -121,8 +131,8 @@ export default async function handler(req, res) {
         } catch (_) {}
       }
     } else {
-      // If no photos and this is first contact, set/keep a sensible stage
-      if (!lead.stage || lead.stage === 'cold') {
+      // Only set qualifying if lead is new/cold; don't override progressed stages
+      if (!existingStage || existingStage === 'cold') {
         await supa.from('leads').update({ stage: 'qualifying' }).eq('id', leadId);
       }
     }
@@ -154,7 +164,7 @@ export default async function handler(req, res) {
       method: 'POST',
       body: JSON.stringify({
         assistant_id: process.env.OPENAI_ASSISTANT_ID,
-        metadata: { phone: from, stage: hasPhotos ? 'awaiting_owner_quote' : (lead.stage || 'qualifying') },
+        metadata: { phone: from, stage: hasPhotos ? 'awaiting_owner_quote' : (existingStage || 'qualifying') },
       }),
     });
 
