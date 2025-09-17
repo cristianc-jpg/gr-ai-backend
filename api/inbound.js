@@ -45,9 +45,20 @@ function isValidTwilio(req, paramsObj) {
 function normE164(s) {
   const digits = String(s || '').replace(/\D/g, '');
   if (!digits) return '';
-  // If already starts with 1 and length 11, keep; otherwise prefix +1
-  const d10 = digits.length === 11 && digits.startsWith('1') ? digits : (digits.length === 10 ? '1' + digits : digits);
+  const d10 = digits.length === 11 && digits.startsWith('1') ? digits
+           : digits.length === 10 ? '1' + digits
+           : digits;
   return `+${d10}`;
+}
+
+// Parse owner command like "6" or "6 +13465551234"
+function detectOwnerHoursAndPhone(text) {
+  const t = String(text || '').trim();
+  const hm = t.match(/\b([2-8])\b/);
+  const hours = hm ? parseInt(hm[1], 10) : null;
+  const pm = t.match(/(\+?1?\D?\d{3}\D?\d{3}\D?\d{4})/);
+  const phone = pm ? normE164(pm[1]) : null;
+  return { hours, phone };
 }
 
 // Helper: determine if stage is already at/after quote
@@ -66,8 +77,10 @@ export default async function handler(req, res) {
     // Parse Twilio x-www-form-urlencoded
     const raw = await readRawBody(req);
     const p = typeof raw === 'string' && raw.length ? parseQuery(raw) : (req.body || {});
-    const from = normE164((p.From || '').toString().replace(/^whatsapp:/, ''));
-    const to   = normE164((p.To   || '').toString().replace(/^whatsapp:/, ''));
+    const fromRaw = (p.From || '').toString().replace(/^whatsapp:/, '');
+    const toRaw   = (p.To   || '').toString().replace(/^whatsapp:/, '');
+    const from = normE164(fromRaw);
+    const to   = normE164(toRaw);
     const body = (p.Body || '').toString();
     const sid  = (p.MessageSid || '').toString();
     const numMedia = parseInt(p.NumMedia || '0', 10) || 0;
@@ -77,7 +90,102 @@ export default async function handler(req, res) {
     }
     if (!from) return res.status(200).json({ ok: false, error: 'Missing From' });
 
-    // Upsert the lead by phone
+    // ---------- OWNER CONTROL SHORT-CIRCUIT ----------
+    const ownerCell = process.env.OWNER_CELL ? normE164(process.env.OWNER_CELL) : '';
+    const fromE164  = from;
+
+    if (ownerCell && fromE164 === ownerCell) {
+      const { hours, phone: explicitPhone } = detectOwnerHoursAndPhone(body);
+
+      if (!hours || hours < 2 || hours > 8) {
+        await twilioClient.messages.create({
+          from: process.env.TWILIO_FROM_NUMBER,
+          to: fromE164,
+          body: 'Reply with a number 2–8 to send the hour estimate. To target a specific number, use e.g. "6 +13465884264".'
+        });
+        return res.status(200).json({ ok: true, owner_hint: true });
+      }
+
+      // Resolve target lead: explicit phone beats queue
+      let target = null;
+      if (explicitPhone) {
+        const { data: byPhone, error: lerr } = await supa
+          .from('leads')
+          .select('id, phone, name')
+          .eq('phone', explicitPhone)
+          .maybeSingle();
+        if (lerr) throw lerr;
+        target = byPhone || null;
+      } else {
+        const { data: awaiting, error: aerr } = await supa
+          .from('leads')
+          .select('id, phone, name')
+          .eq('stage', 'awaiting_owner_quote')
+          .order('updated_at', { ascending: false })
+          .limit(1);
+        if (aerr) throw aerr;
+        target = awaiting?.[0] || null;
+      }
+
+      if (!target) {
+        await twilioClient.messages.create({
+          from: process.env.TWILIO_FROM_NUMBER,
+          to: fromE164,
+          body: 'No lead found to send that estimate. Include the phone, e.g. "6 +13465884264".'
+        });
+        return res.status(200).json({ ok: false, reason: 'no_target' });
+      }
+
+      const quoteText =
+        `Here’s your time estimate for the Garage Raid: ~${hours} hour${hours>1?'s':''} on site for a two-person team.\n\n` +
+        `What day works best? We hold morning (8–12) and early afternoon (12–3) arrivals. ` +
+        `If you’d like to see openings, just say “options”.`;
+
+      // Send quote to customer
+      const sentQuote = await twilioClient.messages.create({
+        from: process.env.TWILIO_FROM_NUMBER,
+        to: target.phone,
+        body: quoteText
+      });
+
+      // Log + stage update + schedule D+1 follow-up (best-effort)
+      await supa.from('messages').insert({
+        lead_id: target.id,
+        direction: 'outbound',
+        body: quoteText,
+        channel: 'sms',
+        twilio_message_id: sentQuote.sid
+      });
+      await supa.from('leads').update({ stage: 'quote_sent' }).eq('id', target.id);
+      try {
+        await supa.from('followups').insert({
+          lead_id: target.id,
+          due_at: new Date(Date.now() + 24*60*60*1000).toISOString(),
+          kind: 'quote_d1'
+        });
+      } catch (_) {}
+
+      // Confirm back to owner
+      await twilioClient.messages.create({
+        from: process.env.TWILIO_FROM_NUMBER,
+        to: fromE164,
+        body: `Sent ${hours}h estimate to ${target.name || target.phone}.`
+      });
+
+      // IMPORTANT: stop here; do not call OpenAI for owner commands
+      return res.status(200).json({ ok: true, owner_quote_sent: true, hours, to: target.phone });
+    }
+    // ---------- END OWNER CONTROL SHORT-CIRCUIT ----------
+
+    // Detect photos (MMS)
+    const mediaUrls = [];
+    for (let i = 0; i < numMedia; i++) {
+      const url = p[`MediaUrl${i}`];
+      if (url) mediaUrls.push(String(url));
+    }
+    const hasPhotos = mediaUrls.length > 0;
+
+    // Upsert the (customer) lead by phone
     const { data: lead, error: upErr } = await supa
       .from('leads')
       .upsert({ phone: from }, { onConflict: 'phone' })
@@ -88,14 +196,6 @@ export default async function handler(req, res) {
     const leadId = lead.id;
     const existingStage = lead.stage || null;
 
-    // Detect photos (MMS)
-    const mediaUrls = [];
-    for (let i = 0; i < numMedia; i++) {
-      const url = p[`MediaUrl${i}`];
-      if (url) mediaUrls.push(String(url));
-    }
-    const hasPhotos = mediaUrls.length > 0;
-
     // Store inbound message
     const insertPayload = {
       lead_id: leadId,
@@ -103,25 +203,22 @@ export default async function handler(req, res) {
       body: body || (hasPhotos ? '[Photo(s) received]' : ''),
       channel: 'sms',
       twilio_message_id: sid || null,
-      // If you later add a media_urls jsonb column, you can include it here:
-      // media_urls: hasPhotos ? mediaUrls : null,
+      // media_urls: hasPhotos ? mediaUrls : null, // if you later add this column
     };
     const { error: msgErr } = await supa.from('messages').insert(insertPayload);
     if (msgErr) throw msgErr;
 
     // Stage updates (idempotent; never downgrade)
     if (hasPhotos) {
-      // Move to awaiting_owner_quote only if not already at/after quote
       if (!isAtOrAfterQuote(existingStage) && existingStage !== 'awaiting_owner_quote') {
         await supa.from('leads').update({ stage: 'awaiting_owner_quote' }).eq('id', leadId);
       }
-
-      // Owner alert (single path; we only message OWNER_CELL to avoid duplicates)
+      // Owner alert (single path)
       if (process.env.OWNER_CELL && process.env.TWILIO_FROM_NUMBER) {
         const count = mediaUrls.length;
         const alertText =
           `Photos in from ${from} (${count}). ` +
-          `Reply with a number 2–8 on the owner line to set hours.`;
+          `Reply with 2–8 on the owner line to set hours.`;
         try {
           await twilioClient.messages.create({
             from: process.env.TWILIO_FROM_NUMBER,
@@ -131,7 +228,6 @@ export default async function handler(req, res) {
         } catch (_) {}
       }
     } else {
-      // Only set qualifying if lead is new/cold; don't override progressed stages
       if (!existingStage || existingStage === 'cold') {
         await supa.from('leads').update({ stage: 'qualifying' }).eq('id', leadId);
       }
@@ -159,7 +255,7 @@ export default async function handler(req, res) {
       });
     }
 
-    // Create a short run (we keep it snappy)
+    // Create a short run
     const run = await openai(`/threads/${threadId}/runs`, {
       method: 'POST',
       body: JSON.stringify({
@@ -195,7 +291,7 @@ export default async function handler(req, res) {
     let reply =
       last?.content?.[0]?.text?.value ||
       (hasPhotos
-        ? 'Got your photos—thank you. I’m reviewing them now and will send your time estimate shortly.'
+        ? 'Got your photos—thank you. The owner will review and text your time estimate shortly.'
         : 'Hi—this is Garage Raiders. Two wide photos of your garage is the fastest way to get a precise time estimate.');
 
     // Remove bracket citations if any
