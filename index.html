@@ -24,6 +24,8 @@
     button { border-radius: 8px; padding: 10px 14px; cursor: pointer; }
     button:hover { background: #171717; }
     .muted { color: #9a9a9a; font-size: 12px; }
+    a.link { color: #7af; text-decoration: none; }
+    a.link:hover { text-decoration: underline; }
   </style>
   <script src="https://unpkg.com/@supabase/supabase-js@2"></script>
 </head>
@@ -48,11 +50,9 @@
     preload="auto"></audio>
 
   <script>
-  // ====== CONFIG: paste your own values ======
+  // ====== CONFIG ======
   const SUPABASE_URL = "https://ifvuruqymvjcjqafnrkg.supabase.co";
   const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImlmdnVydXF5bXZqY2pxYWZucmtnIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTY5OTM3MjksImV4cCI6MjA3MjU2OTcyOX0.sieeTiuCenc8Hwapto01tNeCiXdVhjLo9Jb0OC-MYfk";
-
-  // ====== Supabase client (browser-safe) ======
   const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
   // ====== DOM refs ======
@@ -65,8 +65,8 @@
 
   // ====== State ======
   let currentLead = null;
-  let lastSeenMsgId = null;
   let loadedMsgIds = new Set();
+  let currentGalleryToken = null;
 
   // ====== Helpers ======
   async function showNotification(title, body) {
@@ -83,38 +83,25 @@
     const b = document.createElement('div');
     b.className = 'msg ' + (m.direction === 'outbound' ? 'out' : 'in');
 
-    // Text
+    // Text content
     if (m.body) {
       const p = document.createElement('div');
       p.textContent = m.body;
       b.appendChild(p);
     }
 
-    // Thumbnails if any
-    if (Array.isArray(m.media_urls) && m.media_urls.length) {
-      const gallery = document.createElement('div');
-      gallery.style.display = 'flex';
-      gallery.style.flexWrap = 'wrap';
-      gallery.style.gap = '8px';
-      gallery.style.marginTop = '8px';
-
-      m.media_urls.forEach(url => {
-        const a = document.createElement('a');
-        a.href = url;
-        a.target = '_blank';
-        const img = document.createElement('img');
-        img.src = url;
-        img.alt = 'photo';
-        img.loading = 'lazy';
-        img.style.maxWidth = '140px';
-        img.style.maxHeight = '140px';
-        img.style.borderRadius = '8px';
-        img.style.objectFit = 'cover';
-        a.appendChild(img);
-        gallery.appendChild(a);
-      });
-
-      b.appendChild(gallery);
+    // Lead-wide gallery link if this message has media_paths
+    if (Array.isArray(m.media_paths) && m.media_paths.length && currentGalleryToken) {
+      const base = window.location.origin;
+      const a = document.createElement('a');
+      a.href = `${base}/photos.html?token=${encodeURIComponent(currentGalleryToken)}`;
+      a.target = '_blank';
+      a.className = 'link';
+      a.style.display = 'block';
+      a.style.marginTop = '6px';
+      a.style.fontSize = '12px';
+      a.textContent = `📷 View ${m.media_paths.length} photo(s)`;
+      b.appendChild(a);
     }
 
     return b;
@@ -138,10 +125,10 @@
 
   async function selectLead(lead) {
     currentLead = lead;
+    currentGalleryToken = null;
     leadTitle.textContent = lead.name || 'Lead';
     leadPhone.textContent = lead.phone;
     loadedMsgIds.clear();
-    lastSeenMsgId = null;
     thread.innerHTML = '';
     await loadMessages(lead.id);
     thread.scrollTop = thread.scrollHeight;
@@ -151,17 +138,16 @@
     const res = await fetch('/api/messages?lead_id=' + encodeURIComponent(lead_id));
     const data = await res.json();
     const msgs = data.messages || [];
+    currentGalleryToken = data.gallery_token || null;
 
     msgs.forEach(m => {
-      if (loadedMsgIds.has(m.id)) return; // already shown
+      if (loadedMsgIds.has(m.id)) return;
       const bubble = renderMessageBubble(m);
       thread.appendChild(bubble);
       loadedMsgIds.add(m.id);
     });
 
     if (msgs.length > 0) {
-      const newest = msgs[msgs.length - 1];
-      lastSeenMsgId = newest.id;
       thread.scrollTop = thread.scrollHeight;
     }
   }
@@ -180,7 +166,7 @@
     if (res.ok) {
       replyBox.value = '';
       // Optimistic add
-      const m = { id: 'temp-' + Math.random(), direction: 'outbound', body, media_urls: null };
+      const m = { id: 'temp-' + Math.random(), direction: 'outbound', body, media_paths: null };
       const bubble = renderMessageBubble(m);
       thread.appendChild(bubble);
       thread.scrollTop = thread.scrollHeight;
@@ -195,7 +181,6 @@
   });
 
   // ====== Realtime subscription: new messages ======
-  // Make sure Realtime is enabled on the 'messages' table (INSERT).
   supabase
     .channel('messages-realtime')
     .on('postgres_changes',
@@ -203,16 +188,15 @@
       async (payload) => {
         const m = payload.new;
 
-        // Update the left lead list preview
+        // Update left list
         loadLeads();
 
-        // If we're viewing this lead, append the message live
+        // If we're viewing this lead, append live
         if (currentLead && m.lead_id === currentLead.id) {
           if (!loadedMsgIds.has(m.id)) {
             const bubble = renderMessageBubble(m);
             thread.appendChild(bubble);
             loadedMsgIds.add(m.id);
-            lastSeenMsgId = m.id;
             thread.scrollTop = thread.scrollHeight;
           }
 
@@ -227,22 +211,16 @@
     )
     .subscribe();
 
-  // ====== Debug: log every realtime event to console ======
+  // Debug realtime
   supabase
     .channel('debug-messages')
-    .on(
-      'postgres_changes',
-      { event: 'INSERT', schema: 'public', table: 'messages' },
-      payload => console.log('Realtime event:', payload)
-    )
+    .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages' },
+      payload => console.log('Realtime event:', payload))
     .subscribe();
 
-  // ====== Initial load ======
+  // Initial load
   loadLeads();
-
-  // (Optional) Light fallback: refresh the lead list every 30s in case the socket drops.
   setInterval(loadLeads, 30000);
   </script>
-
 </body>
 </html>
