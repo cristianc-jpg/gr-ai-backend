@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Lead Photos</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin:0; background:#0b0b0b; color:#f5f5f5; }
+    .wrap { max-width: 980px; margin: 0 auto; padding: 20px; }
+    h1 { font-size: 18px; margin: 0 0 12px 0; color:#ddd;}
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px,1fr)); gap: 12px; }
+    .card { background:#141414; border:1px solid #222; border-radius:12px; padding:8px; }
+    .card img { width:100%; height:160px; object-fit:cover; border-radius:8px; display:block; }
+    .meta { font-size: 12px; color:#aaa; margin-top:6px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1 id="title">Lead Photos</h1>
+    <div id="grid" class="grid"></div>
+  </div>
+  <script>
+    async function main() {
+      const p = new URLSearchParams(location.search);
+      const lead_id = p.get('lead_id') || '';
+      const phone = p.get('phone') || '';
+      if (!lead_id && !phone) {
+        document.getElementById('title').textContent = 'Missing lead_id or phone';
+        return;
+      }
+      const qs = lead_id ? ('lead_id=' + encodeURIComponent(lead_id)) : ('phone=' + encodeURIComponent(phone));
+      const r = await fetch('/api/lead-media?' + qs);
+      const j = await r.json();
+      document.getElementById('title').textContent =
+        j.ok ? `Photos (${j.count})` : ('Error: ' + (j.error || 'unknown'));
+
+      const grid = document.getElementById('grid');
+      (j.items || []).forEach(it => {
+        const div = document.createElement('a');
+        div.className = 'card';
+        div.href = it.url;
+        div.target = '_blank';
+        div.innerHTML = `
+          <img src="${it.url}" alt="photo" loading="lazy"/>
+          <div class="meta">${new Date(it.created_at).toLocaleString()}</div>
+        `;
+        grid.appendChild(div);
+      });
+    }
+    main();
+  </script>
+</body>
+</html>
