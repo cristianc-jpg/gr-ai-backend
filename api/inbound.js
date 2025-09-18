@@ -66,6 +66,24 @@ function isAtOrAfterQuote(stage) {
   return stage === 'quote_sent' || stage === 'closed_won' || stage === 'closed_lost';
 }
 
+// ---------- Twilio media fetch + upload helpers ----------
+async function fetchTwilioMedia(url) {
+  // Twilio MMS media URLs require basic auth with your SID/token
+  const auth = Buffer.from(`${process.env.TWILIO_ACCOUNT_SID}:${process.env.TWILIO_AUTH_TOKEN}`).toString('base64');
+  const r = await fetch(url, { headers: { Authorization: `Basic ${auth}` } });
+  if (!r.ok) throw new Error(`media fetch ${r.status}`);
+  const contentType = r.headers.get('content-type') || 'application/octet-stream';
+  const buf = await r.arrayBuffer();
+  // Convert ArrayBuffer -> Node Buffer for supabase-js in Node runtimes
+  const nodeBuf = Buffer.from(new Uint8Array(buf));
+  return { nodeBuf, contentType };
+}
+
+function extFromContentType(ct) {
+  const map = { 'image/jpeg':'jpg','image/jpg':'jpg','image/png':'png','image/webp':'webp','image/gif':'gif' };
+  return map[ct] || 'bin';
+}
+
 // ---------- main ----------
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
@@ -196,6 +214,28 @@ export default async function handler(req, res) {
     const leadId = lead.id;
     const existingStage = lead.stage || null;
 
+    // If MMS: upload to Supabase Storage and build public links
+    let publicMedia = [];
+    if (hasPhotos) {
+      try {
+        for (let i = 0; i < mediaUrls.length; i++) {
+          const { nodeBuf, contentType } = await fetchTwilioMedia(mediaUrls[i]);
+          const ext = extFromContentType(contentType);
+          const key = `${leadId}/${Date.now()}_${i}.${ext}`; // folder per lead
+          const up = await supa.storage.from('inbound-mms').upload(key, nodeBuf, {
+            contentType,
+            upsert: false
+          });
+          if (up.error) throw up.error;
+          publicMedia.push(`${process.env.SUPABASE_URL}/storage/v1/object/public/inbound-mms/${key}`);
+        }
+      } catch (e) {
+        console.warn('MMS upload warning:', e?.message || e);
+        // proceed without links if upload failed
+        publicMedia = [];
+      }
+    }
+
     // Store inbound message
     const insertPayload = {
       lead_id: leadId,
@@ -203,7 +243,7 @@ export default async function handler(req, res) {
       body: body || (hasPhotos ? '[Photo(s) received]' : ''),
       channel: 'sms',
       twilio_message_id: sid || null,
-      // media_urls: hasPhotos ? mediaUrls : null, // if you later add this column
+      media_urls: hasPhotos && publicMedia.length ? publicMedia : null,
     };
     const { error: msgErr } = await supa.from('messages').insert(insertPayload);
     if (msgErr) throw msgErr;
@@ -213,12 +253,13 @@ export default async function handler(req, res) {
       if (!isAtOrAfterQuote(existingStage) && existingStage !== 'awaiting_owner_quote') {
         await supa.from('leads').update({ stage: 'awaiting_owner_quote' }).eq('id', leadId);
       }
-      // Owner alert (single path)
+      // Owner alert with clickable links (cap 3 to limit SMS segments)
       if (process.env.OWNER_CELL && process.env.TWILIO_FROM_NUMBER) {
-        const count = mediaUrls.length;
+        const links = (publicMedia || []).slice(0, 3);
+        const more = publicMedia.length > links.length ? ` (+${publicMedia.length - links.length} more)` : '';
         const alertText =
-          `Photos in from ${from} (${count}). ` +
-          `Reply with 2–8 on the owner line to set hours.`;
+          `Photos in from ${from} (${publicMedia.length}). Reply 2–8 to set hours.` +
+          (links.length ? `\n${links.join('\n')}${more}` : '');
         try {
           await twilioClient.messages.create({
             from: process.env.TWILIO_FROM_NUMBER,
