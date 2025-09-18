@@ -84,6 +84,18 @@ function extFromContentType(ct) {
   return map[ct] || 'bin';
 }
 
+function readableKey(fromE164, i, ext) {
+  // phone folder (no '+'), date folder, timestamp-based filename
+  const phoneSafe = String(fromE164 || '').replace('+','');
+  const d = new Date();
+  const y = d.getFullYear();
+  const m = String(d.getMonth()+1).padStart(2,'0');
+  const day = String(d.getDate()).padStart(2,'0');
+  const dateFolder = `${y}-${m}-${day}`;
+  const ts = d.getTime();
+  return `${phoneSafe}/${dateFolder}/${ts}_${i}.${ext}`;
+}
+
 // ---------- main ----------
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
@@ -221,7 +233,7 @@ export default async function handler(req, res) {
         for (let i = 0; i < mediaUrls.length; i++) {
           const { nodeBuf, contentType } = await fetchTwilioMedia(mediaUrls[i]);
           const ext = extFromContentType(contentType);
-          const key = `${leadId}/${Date.now()}_${i}.${ext}`; // folder per lead
+          const key = readableKey(from, i, ext); // phone/date/timestamp path for readability
           const up = await supa.storage.from('inbound-mms').upload(key, nodeBuf, {
             contentType,
             upsert: false
