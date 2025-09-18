@@ -40,18 +40,18 @@ function render(tpl, vars = {}) {
 // Brand-approved templates by (stage, intent)
 const TPL = {
   // GENERAL / TOP OF FUNNEL
-  'cold:ask_photos': `Hi! Fastest way to get your Garage Raid estimate—please text two wide photos of the garage.`,
+  'cold:ask_photos': `Hi! Fastest way to get your Garage Raid estimate—please text a few photos of the garage.`,
 
-  'qualifying:ask_photos': `Got it. Two wide photos of your garage is the fastest way to get a precise time estimate.`,
+  'qualifying:ask_photos': `Got it. A couple photos of your garage is the fastest way to get a precise time estimate.`,
 
   // WHEN PHOTOS ARRIVE
-  'awaiting_owner_quote:ack_photos': `Got your photos—thank you. The owner will review and text your time estimate shortly.`,
+  'awaiting_owner_quote:ack_photos': `Got your photos—thank you. Our team will review them and text your time estimate shortly.`,
 
   // QUOTE SENT → NURTURE
-  'quote_sent:nudge_hold_window': `Quick check-in—would you like to hold a morning (8–12) or early afternoon (12–3) arrival? If you want date options, just say “options”.`,
+  'quote_sent:nudge_hold_window': `Quick check-in—would you like to hold a morning or early afternoon arrival? If you want date options, just say “options”.`,
 
   // OPTIONS ASK
-  'any:options_info': `We can hold a morning (8–12) or early afternoon (12–3) arrival. Do you have 2–3 days that work best? I can check openings.`,
+  'any:options_info': `We can hold a morning or early afternoon arrival. Do you have 2–3 days that work best? I can check openings.`,
 
   // PRICE QUESTIONS
   'any:price_explain': `We price by on-site hours for a two-person team. Photos help us quote precisely and avoid surprises. Two wide photos of the garage is perfect.`,
