@@ -42,10 +42,10 @@
       </div>
     </div>
   </div>
-  
-<audio id="alertSound" 
-  src="https://actions.google.com/sounds/v1/alarms/beep_short.ogg" 
-  preload="auto"></audio>
+
+  <audio id="alertSound"
+    src="https://actions.google.com/sounds/v1/alarms/beep_short.ogg"
+    preload="auto"></audio>
 
   <script>
   // ====== CONFIG: paste your own values ======
@@ -79,6 +79,47 @@
     }
   }
 
+  function renderMessageBubble(m) {
+    const b = document.createElement('div');
+    b.className = 'msg ' + (m.direction === 'outbound' ? 'out' : 'in');
+
+    // Text
+    if (m.body) {
+      const p = document.createElement('div');
+      p.textContent = m.body;
+      b.appendChild(p);
+    }
+
+    // Thumbnails if any
+    if (Array.isArray(m.media_urls) && m.media_urls.length) {
+      const gallery = document.createElement('div');
+      gallery.style.display = 'flex';
+      gallery.style.flexWrap = 'wrap';
+      gallery.style.gap = '8px';
+      gallery.style.marginTop = '8px';
+
+      m.media_urls.forEach(url => {
+        const a = document.createElement('a');
+        a.href = url;
+        a.target = '_blank';
+        const img = document.createElement('img');
+        img.src = url;
+        img.alt = 'photo';
+        img.loading = 'lazy';
+        img.style.maxWidth = '140px';
+        img.style.maxHeight = '140px';
+        img.style.borderRadius = '8px';
+        img.style.objectFit = 'cover';
+        a.appendChild(img);
+        gallery.appendChild(a);
+      });
+
+      b.appendChild(gallery);
+    }
+
+    return b;
+  }
+
   async function loadLeads() {
     const res = await fetch('/api/leads');
     const data = await res.json();
@@ -88,7 +129,7 @@
       div.className = 'lead';
       div.innerHTML = `
         <div class="phone">${l.name ? l.name + ' · ' : ''}${l.phone}</div>
-        <div class="preview">${l.last_message || ''}</div>
+        <div class="preview">${(l.last_message || '').replace(/\s+/g,' ').trim()}</div>
       `;
       div.onclick = () => selectLead(l);
       leadList.appendChild(div);
@@ -113,11 +154,8 @@
 
     msgs.forEach(m => {
       if (loadedMsgIds.has(m.id)) return; // already shown
-
-      const b = document.createElement('div');
-      b.className = 'msg ' + (m.direction === 'outbound' ? 'out' : 'in');
-      b.textContent = m.body;
-      thread.appendChild(b);
+      const bubble = renderMessageBubble(m);
+      thread.appendChild(bubble);
       loadedMsgIds.add(m.id);
     });
 
@@ -141,13 +179,10 @@
     });
     if (res.ok) {
       replyBox.value = '';
-      // The outbound insert will also arrive via Realtime in a moment.
-      // For snappier UX, we can optimistically add it:
-      // (optional)
-      const b = document.createElement('div');
-      b.className = 'msg out';
-      b.textContent = body;
-      thread.appendChild(b);
+      // Optimistic add
+      const m = { id: 'temp-' + Math.random(), direction: 'outbound', body, media_urls: null };
+      const bubble = renderMessageBubble(m);
+      thread.appendChild(bubble);
       thread.scrollTop = thread.scrollHeight;
     } else {
       alert('Send failed.');
@@ -174,9 +209,7 @@
         // If we're viewing this lead, append the message live
         if (currentLead && m.lead_id === currentLead.id) {
           if (!loadedMsgIds.has(m.id)) {
-            const bubble = document.createElement('div');
-            bubble.className = 'msg ' + (m.direction === 'outbound' ? 'out' : 'in');
-            bubble.textContent = m.body;
+            const bubble = renderMessageBubble(m);
             thread.appendChild(bubble);
             loadedMsgIds.add(m.id);
             lastSeenMsgId = m.id;
@@ -187,28 +220,29 @@
           if (m.direction === 'inbound') {
             const audio = document.getElementById('alertSound');
             if (audio) audio.play().catch(() => {});
-            showNotification('📩 New message from ' + (currentLead.phone || ''), m.body);
+            showNotification('📩 New message from ' + (currentLead.phone || ''), m.body || 'New media');
           }
         }
       }
     )
     .subscribe();
-    // ====== Debug: log every realtime event to console ======
-supabase
-  .channel('debug-messages')
-  .on(
-    'postgres_changes',
-    { event: 'INSERT', schema: 'public', table: 'messages' },
-    payload => console.log('Realtime event:', payload)
-  )
-  .subscribe();
+
+  // ====== Debug: log every realtime event to console ======
+  supabase
+    .channel('debug-messages')
+    .on(
+      'postgres_changes',
+      { event: 'INSERT', schema: 'public', table: 'messages' },
+      payload => console.log('Realtime event:', payload)
+    )
+    .subscribe();
 
   // ====== Initial load ======
   loadLeads();
 
   // (Optional) Light fallback: refresh the lead list every 30s in case the socket drops.
   setInterval(loadLeads, 30000);
-</script>
+  </script>
 
 </body>
 </html>
