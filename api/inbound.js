@@ -15,8 +15,8 @@ const OA_HEADERS = {
 // ---------- templates ----------
 const TEMPLATES = {
   photos: "Got your photos, thank you. The team will review and text your estimate shortly.",
-  estimate: "The fastest way is to send a couple photos of your garage. That lets us give you an exact time estimate for your Garage Raid.",
-  options: "We typically typically start at 9:00 AM, but we may have afternoon slots as well. What works best for you?",
+  estimate: "The fastest way is to send us a couple photos of your garage. That lets us give you an exact time estimate for your Garage Raid.",
+  options: "We typically start at 9:00 AM, but we may have afternoon slots as well. What works best for you?",
   pricing: "Our Garage Raid service is $139 per hour for a team of two raiders, plus a one-time $49 fuel fee. Once we see your garage photos, we can give you an accurate time estimate.",
   faq: "Yes! We can install ceiling racks, shelves, or even coat your floor with epoxy. Every Garage Raid includes deep cleaning, organizing, and donation drop-off."
 };
@@ -205,14 +205,17 @@ export default async function handler(req, res) {
         body: reply
       });
       await supa.from('messages').insert({
-        lead_id: leadId, direction:'outbound', body: reply, channel:'sms', twilio_message_id: sent.sid
+        lead_id: leadId,
+        direction:'outbound',
+        body: reply,
+        channel:'sms',
+        twilio_message_id: sent.sid,
+        metadata: { source: "template", intent }
       });
       return res.status(200).json({ ok:true, leadId, handledBy: "template", intent });
     }
 
     // --- if no template match, continue with OpenAI flow ---
-
-    // Store inbound
     await supa.from('messages').insert({
       lead_id: leadId,
       direction: 'inbound',
@@ -221,7 +224,6 @@ export default async function handler(req, res) {
       twilio_message_id: sid || null
     });
 
-    // Ensure thread
     let threadId = lead.thread_id;
     if (!threadId) {
       const created = await openai('/threads',{ method:'POST', body: JSON.stringify({}) });
@@ -242,7 +244,6 @@ export default async function handler(req, res) {
       })
     });
 
-    // Poll short
     let status = run; const deadline = Date.now() + 10000;
     while (['queued','in_progress','cancelling'].includes(status.status)) {
       if (Date.now() > deadline) break;
@@ -255,15 +256,20 @@ export default async function handler(req, res) {
     let reply =
       last?.content?.[0]?.text?.value ||
       (hasPhotos
-        ? 'Got your photos—thank you. The owner will review and text your estimate shortly.'
-        : 'Hi—this is Garage Raiders. Two wide photos of your garage is the fastest way to get a precise estimate.');
+        ? TEMPLATES.photos
+        : TEMPLATES.estimate);
     reply = reply.replace(/【\d+:\d+†.*?†.*?】/g,'').replace(/\[\d+\]/g,'').replace(/\(source.*?\)/gi,'');
 
     const sent = await twilioClient.messages.create({
       from: process.env.TWILIO_FROM_NUMBER, to: from, body: reply
     });
     await supa.from('messages').insert({
-      lead_id: leadId, direction:'outbound', body: reply, channel:'sms', twilio_message_id: sent.sid
+      lead_id: leadId,
+      direction:'outbound',
+      body: reply,
+      channel:'sms',
+      twilio_message_id: sent.sid,
+      metadata: { source: "assistant" }
     });
 
     return res.status(200).json({ ok:true, leadId, threadId, runId: run.id });
