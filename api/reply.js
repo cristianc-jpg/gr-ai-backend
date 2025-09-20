@@ -5,7 +5,7 @@ import Twilio from 'twilio';
 const supa = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
 const client = Twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 
-// Normalize to E.164 (+1XXXXXXXXXX).
+// Normalize to E.164 (+1XXXXXXXXXX). Adjust if you serve other countries.
 function normE164(s) {
   const digits = String(s || '').replace(/\D/g, '');
   if (!digits) return '';
@@ -15,7 +15,7 @@ function normE164(s) {
   return `+${d10}`;
 }
 
-// Detect “quote-like” messages (2–8 hours).
+// Simple detector for “quote-like” messages (2–8 hours)
 function detectQuotedHours(text) {
   const t = (text || '').toLowerCase();
   const m = t.match(/\b([2-8])\s*(?:-|to\s*)?[2-8]?\s*(?:h|hr|hrs|hour|hours)\b/);
@@ -37,7 +37,7 @@ export default async function handler(req, res) {
       return res.status(400).json({ ok: false, error: 'Missing "to" or "body"' });
     }
 
-    // Upsert lead
+    // Upsert lead by phone
     const { data: leadRow, error: upsertErr } = await supa
       .from('leads')
       .upsert({ phone: to }, { onConflict: 'phone' })
@@ -53,13 +53,14 @@ export default async function handler(req, res) {
     });
 
     // Store outbound message
-    await supa.from('messages').insert({
+    const { error: msgErr } = await supa.from('messages').insert({
       lead_id: leadRow.id,
       direction: 'outbound',
       body,
       channel: 'sms',
       twilio_message_id: msg.sid
     });
+    if (msgErr) throw msgErr;
 
     // Stage updates
     const updates = {};
@@ -77,7 +78,9 @@ export default async function handler(req, res) {
           due_at: dueAt,
           kind: 'quote_d1'
         });
-      } catch (_) {}
+      } catch (e) {
+        console.warn('followup schedule skipped:', e?.message || e);
+      }
     }
 
     if (Object.keys(updates).length > 0) {
