@@ -18,11 +18,51 @@ function normE164(s) {
 // Simple detector for “quote-like” messages (2–8 hours)
 function detectQuotedHours(text) {
   const t = (text || '').toLowerCase();
-  const m = t.match(/\b([2-8])\s*(?:-|to\s*)?[2-8]?\s*(?:h|hr|hrs|hour|hours)\b/);
+  const m = t.match(/\b([2-8])\s*(?:-|to\s*)?[2-8]?\s*(?:h|hr|hrs|hour|hours)?\b/);
   if (m && m[1]) return parseInt(m[1], 10);
-  const m2 = t.match(/[~≈]\s*([2-8])\b/);
-  if (m2 && m2[1] && /\bh(?:r|rs)?|hour/.test(t)) return parseInt(m2[1], 10);
   return null;
+}
+
+// Long customer quote template
+function buildCustomerQuote(hours) {
+  const subtotal = (139 * hours) + 49;
+  const hLabel = `hour${hours > 1 ? 's' : ''}`;
+  return (
+`Hi,
+
+Cristian here with Garage Raiders, thanks for the photos.
+
+Here’s your custom estimate:
+• ${hours} ${hLabel} — $${subtotal} + tax
+\t($139/hr x ${hours} ${hLabel} + $49 fuel)
+• You only pay for the time used, down to the minute.
+
+Included:
+• Full sort, categorization & organization
+• Deep cleaning of the entire space
+• Heavy-duty trash bags
+• Free donation drop-off to any organization
+
+Optional Add-On:
+• Trash haul-away — $249 flat rate (up to 12 cubic yards)
+\tNote: We cannot remove paint, chemicals, TVs, microwaves, or freon appliances.
+
+Storage Upgrades:
+Explore ceiling racks, shelving, and premium storage solutions:
+https://www.garageraiders.com/category/all-products
+
+Helpful Links:
+• Strategy: https://www.garageraiders.com/strategy
+
+• Reviews: https://www.garageraiders.com/reviews
+
+• Pay Online or Book with Klarna/Affirm: https://www.garageraiders.com/Raid${hours}Hours
+
+If you have any questions or you're ready to book, just text or call me directly.
+
+Cristian
+Garage Raiders`
+  );
 }
 
 export default async function handler(req, res) {
@@ -30,7 +70,7 @@ export default async function handler(req, res) {
 
   try {
     const toRaw = (req.body?.to || '').toString();
-    const body = (req.body?.body || '').toString();
+    let body = (req.body?.body || '').toString();
     const to = normE164(toRaw);
 
     if (!to || !body) {
@@ -44,6 +84,13 @@ export default async function handler(req, res) {
       .select()
       .single();
     if (upsertErr) throw upsertErr;
+
+    // If message is ONLY an hour hint, auto-expand to full template
+    const hoursQuoted = detectQuotedHours(body);
+    const bareHoursPattern = /^\s*[~≈]?\s*[2-8]\s*(h|hr|hrs|hour|hours)?\s*$/i;
+    if (hoursQuoted && bareHoursPattern.test(body)) {
+      body = buildCustomerQuote(hoursQuoted);
+    }
 
     // Send SMS via Twilio
     const msg = await client.messages.create({
@@ -67,8 +114,6 @@ export default async function handler(req, res) {
     if (!leadRow.stage || leadRow.stage === 'cold') {
       updates.stage = 'qualifying';
     }
-
-    const hoursQuoted = detectQuotedHours(body);
     if (hoursQuoted && hoursQuoted >= 2 && hoursQuoted <= 8) {
       updates.stage = 'quote_sent';
       try {
@@ -82,7 +127,6 @@ export default async function handler(req, res) {
         console.warn('followup schedule skipped:', e?.message || e);
       }
     }
-
     if (Object.keys(updates).length > 0) {
       await supa.from('leads').update(updates).eq('id', leadRow.id);
     }
