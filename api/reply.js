@@ -5,7 +5,7 @@ import Twilio from 'twilio';
 const supa = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
 const client = Twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 
-// Normalize to E.164 (+1XXXXXXXXXX). Adjust if you serve other countries.
+// Normalize to E.164 (+1XXXXXXXXXX).
 function normE164(s) {
   const digits = String(s || '').replace(/\D/g, '');
   if (!digits) return '';
@@ -15,14 +15,11 @@ function normE164(s) {
   return `+${d10}`;
 }
 
-// Simple detector for “quote-like” messages (2–8 hours)
-// Matches: "5 hours", "~5 hr", "5h", "5-6 hours" (takes first number)
+// Detect “quote-like” messages (2–8 hours).
 function detectQuotedHours(text) {
   const t = (text || '').toLowerCase();
-  // prefer numbers 2–8 near hour tokens
   const m = t.match(/\b([2-8])\s*(?:-|to\s*)?[2-8]?\s*(?:h|hr|hrs|hour|hours)\b/);
   if (m && m[1]) return parseInt(m[1], 10);
-  // fallback: "~5" or "≈5" with optional hour tokens elsewhere
   const m2 = t.match(/[~≈]\s*([2-8])\b/);
   if (m2 && m2[1] && /\bh(?:r|rs)?|hour/.test(t)) return parseInt(m2[1], 10);
   return null;
@@ -40,7 +37,7 @@ export default async function handler(req, res) {
       return res.status(400).json({ ok: false, error: 'Missing "to" or "body"' });
     }
 
-    // Upsert lead by phone
+    // Upsert lead
     const { data: leadRow, error: upsertErr } = await supa
       .from('leads')
       .upsert({ phone: to }, { onConflict: 'phone' })
@@ -56,42 +53,33 @@ export default async function handler(req, res) {
     });
 
     // Store outbound message
-    const { error: msgErr } = await supa.from('messages').insert({
+    await supa.from('messages').insert({
       lead_id: leadRow.id,
       direction: 'outbound',
       body,
       channel: 'sms',
       twilio_message_id: msg.sid
     });
-    if (msgErr) throw msgErr;
 
     // Stage updates
     const updates = {};
-    // 1) If brand new/cold, nudge into qualifying
     if (!leadRow.stage || leadRow.stage === 'cold') {
       updates.stage = 'qualifying';
     }
 
-    // 2) If this message looks like a quote, move to quote_sent and schedule D+1 follow-up
     const hoursQuoted = detectQuotedHours(body);
     if (hoursQuoted && hoursQuoted >= 2 && hoursQuoted <= 8) {
       updates.stage = 'quote_sent';
-
-      // Best-effort: schedule a D+1 follow-up if table exists
       try {
         const dueAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
         await supa.from('followups').insert({
           lead_id: leadRow.id,
           due_at: dueAt,
-          kind: 'quote_d1' // handled by your cron-followups, if enabled
+          kind: 'quote_d1'
         });
-      } catch (e) {
-        // Silently ignore if followups table doesn't exist or RLS blocks it
-        console.warn('followup schedule skipped:', e?.message || e);
-      }
+      } catch (_) {}
     }
 
-    // Apply stage changes if any
     if (Object.keys(updates).length > 0) {
       await supa.from('leads').update(updates).eq('id', leadRow.id);
     }
