@@ -3,14 +3,12 @@ import { createClient } from '@supabase/supabase-js';
 import twilio from 'twilio';
 import { parse as parseQuery } from 'querystring';
 
+// NEW: brand-controlled replies and NLU-only classifier
+import { compose } from '../lib/brand.js';
+import { classifyMessage } from '../lib/nlu.js';
+
 const supa = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
 const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
-
-const OA_HEADERS = {
-  Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-  'Content-Type': 'application/json',
-  'OpenAI-Beta': 'assistants=v2',
-};
 
 // ---------- helpers ----------
 async function readRawBody(req) {
@@ -19,18 +17,6 @@ async function readRawBody(req) {
     req.on('data', (c) => (data += c));
     req.on('end', () => resolve(data));
   });
-}
-
-async function openai(path, options = {}) {
-  const res = await fetch(`https://api.openai.com/v1${path}`, {
-    ...options,
-    headers: { ...OA_HEADERS, ...(options.headers || {}) },
-  });
-  if (!res.ok) {
-    const text = await res.text().catch(() => '');
-    throw new Error(`OpenAI ${path} failed: ${res.status} ${text}`);
-  }
-  return res.json();
 }
 
 // Validate Twilio signature (production)
@@ -45,14 +31,50 @@ function isValidTwilio(req, paramsObj) {
 function normE164(s) {
   const digits = String(s || '').replace(/\D/g, '');
   if (!digits) return '';
-  // If already starts with 1 and length 11, keep; otherwise prefix +1
-  const d10 = digits.length === 11 && digits.startsWith('1') ? digits : (digits.length === 10 ? '1' + digits : digits);
+  const d10 = digits.length === 11 && digits.startsWith('1')
+    ? digits
+    : (digits.length === 10 ? '1' + digits : digits);
   return `+${d10}`;
+}
+
+// Parse owner command like "6" or "6 +13465551234"
+function detectOwnerHoursAndPhone(text) {
+  const t = String(text || '').trim();
+  const hm = t.match(/\b([2-8])\b/);
+  const hours = hm ? parseInt(hm[1], 10) : null;
+  const pm = t.match(/(\+?1?\D?\d{3}\D?\d{3}\D?\d{4})/);
+  const phone = pm ? normE164(pm[1]) : null;
+  return { hours, phone };
 }
 
 // Helper: determine if stage is already at/after quote
 function isAtOrAfterQuote(stage) {
   return stage === 'quote_sent' || stage === 'closed_won' || stage === 'closed_lost';
+}
+
+// ---------- Twilio media fetch + upload helpers ----------
+async function fetchTwilioMedia(url) {
+  const auth = Buffer.from(
+    `${process.env.TWILIO_ACCOUNT_SID}:${process.env.TWILIO_AUTH_TOKEN}`
+  ).toString('base64');
+  const r = await fetch(url, { headers: { Authorization: `Basic ${auth}` } });
+  if (!r.ok) throw new Error(`media fetch ${r.status}`);
+  const contentType = r.headers.get('content-type') || 'application/octet-stream';
+  const buf = await r.arrayBuffer();
+  return { nodeBuf: Buffer.from(new Uint8Array(buf)), contentType };
+}
+
+function extFromContentType(ct) {
+  const map = { 'image/jpeg':'jpg','image/jpg':'jpg','image/png':'png','image/webp':'webp','image/gif':'gif' };
+  return map[ct] || 'bin';
+}
+
+function readableKey(fromE164, i, ext) {
+  // phone folder (no '+'), date folder, timestamp-based filename
+  const phoneSafe = String(fromE164 || '').replace('+','');
+  const d = new Date();
+  const dateFolder = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+  return `${phoneSafe}/${dateFolder}/${d.getTime()}_${i}.${ext}`;
 }
 
 // ---------- main ----------
@@ -63,7 +85,6 @@ export default async function handler(req, res) {
   }
 
   try {
-    // Parse Twilio x-www-form-urlencoded
     const raw = await readRawBody(req);
     const p = typeof raw === 'string' && raw.length ? parseQuery(raw) : (req.body || {});
     const from = normE164((p.From || '').toString().replace(/^whatsapp:/, ''));
@@ -72,142 +93,216 @@ export default async function handler(req, res) {
     const sid  = (p.MessageSid || '').toString();
     const numMedia = parseInt(p.NumMedia || '0', 10) || 0;
 
-    if (!isValidTwilio(req, p)) {
-      return res.status(403).json({ ok: false, error: 'Invalid Twilio signature' });
-    }
+    if (!isValidTwilio(req, p)) return res.status(403).json({ ok: false, error: 'Invalid Twilio signature' });
     if (!from) return res.status(200).json({ ok: false, error: 'Missing From' });
 
-    // Upsert the lead by phone
-    const { data: lead, error: upErr } = await supa
+    // ---------- OWNER CONTROL ----------
+    const ownerCell = process.env.OWNER_CELL ? normE164(process.env.OWNER_CELL) : '';
+    if (ownerCell && from === ownerCell) {
+      const { hours, phone: explicitPhone } = detectOwnerHoursAndPhone(body);
+      if (!hours || hours < 2 || hours > 8) {
+        await twilioClient.messages.create({
+          from: process.env.TWILIO_FROM_NUMBER,
+          to: from,
+          body: 'Reply with 2–8 to send the hour estimate. To target a specific number, use "6 +13465551234".'
+        });
+        return res.status(200).json({ ok: true, owner_hint: true });
+      }
+      let target = null;
+      if (explicitPhone) {
+        const { data } = await supa
+          .from('leads')
+          .select('id,phone,name')
+          .eq('phone', explicitPhone)
+          .maybeSingle();
+        target = data || null;
+      } else {
+        const { data } = await supa
+          .from('leads')
+          .select('id,phone,name')
+          .eq('stage','awaiting_owner_quote')
+          .order('updated_at',{ascending:false})
+          .limit(1);
+        target = data?.[0] || null;
+      }
+      if (!target) {
+        await twilioClient.messages.create({
+          from: process.env.TWILIO_FROM_NUMBER,
+          to: from,
+          body: 'No lead found.'
+        });
+        return res.status(200).json({ ok:false });
+      }
+      const quoteText =
+        `Here’s your time estimate for the Garage Raid: ~${hours} hour${hours>1?'s':''} on site for a two-person team.\n\n` +
+        `What day works best? Morning (8–12) or Afternoon (12–3).`;
+      const sentQuote = await twilioClient.messages.create({
+        from: process.env.TWILIO_FROM_NUMBER, to: target.phone, body: quoteText
+      });
+      await supa.from('messages').insert({
+        lead_id: target.id, direction:'outbound', body:quoteText, channel:'sms', twilio_message_id: sentQuote.sid
+      });
+      await supa.from('leads').update({ stage:'quote_sent' }).eq('id', target.id);
+
+      // Best-effort D+1 followup row (if you created the table)
+      try {
+        await supa.from('followups').insert({
+          lead_id: target.id,
+          due_at: new Date(Date.now() + 24*60*60*1000).toISOString(),
+          kind: 'quote_d1'
+        });
+      } catch (_) {}
+
+      await twilioClient.messages.create({
+        from: process.env.TWILIO_FROM_NUMBER, to: from,
+        body:`Sent ${hours}h estimate to ${target.name||target.phone}.`
+      });
+      return res.status(200).json({ ok:true });
+    }
+
+    // ---------- CUSTOMER INBOUND ----------
+    const mediaUrls = [];
+    for (let i=0;i<numMedia;i++) {
+      const url = p[`MediaUrl${i}`];
+      if (url) mediaUrls.push(String(url));
+    }
+    const hasPhotos = mediaUrls.length>0;
+
+    const { data: lead } = await supa
       .from('leads')
-      .upsert({ phone: from }, { onConflict: 'phone' })
+      .upsert({ phone: from },{onConflict:'phone'})
       .select()
       .single();
-    if (upErr) throw upErr;
 
     const leadId = lead.id;
     const existingStage = lead.stage || null;
 
-    // Detect photos (MMS)
-    const mediaUrls = [];
-    for (let i = 0; i < numMedia; i++) {
-      const url = p[`MediaUrl${i}`];
-      if (url) mediaUrls.push(String(url));
+    // Upload photos to private storage; collect storage object KEYS (paths)
+    let mediaPaths = [];
+    if (hasPhotos) {
+      for (let i=0;i<mediaUrls.length;i++) {
+        try {
+          const { nodeBuf, contentType } = await fetchTwilioMedia(mediaUrls[i]);
+          const ext = extFromContentType(contentType);
+          const key = readableKey(from, i, ext);     // e.g. 1737.../2025-09-18/<ts>_0.jpg
+          const up = await supa.storage
+            .from(process.env.INBOUND_BUCKET || 'inbound-mms')
+            .upload(key, nodeBuf, { contentType, upsert:false });
+          if (up.error) throw up.error;
+          mediaPaths.push(key);
+        } catch(e) {
+          console.warn('MMS upload warn:', e?.message || e);
+        }
+      }
     }
-    const hasPhotos = mediaUrls.length > 0;
 
-    // Store inbound message
-    const insertPayload = {
+    // Store inbound message (note: using media_paths, not public links)
+    await supa.from('messages').insert({
       lead_id: leadId,
       direction: 'inbound',
       body: body || (hasPhotos ? '[Photo(s) received]' : ''),
       channel: 'sms',
       twilio_message_id: sid || null,
-      // If you later add a media_urls jsonb column, you can include it here:
-      // media_urls: hasPhotos ? mediaUrls : null,
-    };
-    const { error: msgErr } = await supa.from('messages').insert(insertPayload);
-    if (msgErr) throw msgErr;
+      media_paths: mediaPaths.length ? mediaPaths : null
+    });
 
-    // Stage updates (idempotent; never downgrade)
+    // Stage updates
     if (hasPhotos) {
-      // Move to awaiting_owner_quote only if not already at/after quote
-      if (!isAtOrAfterQuote(existingStage) && existingStage !== 'awaiting_owner_quote') {
-        await supa.from('leads').update({ stage: 'awaiting_owner_quote' }).eq('id', leadId);
+      if (!isAtOrAfterQuote(existingStage) && existingStage!=='awaiting_owner_quote') {
+        await supa.from('leads').update({ stage:'awaiting_owner_quote' }).eq('id', leadId);
       }
-      // 🔹 Track last_intent for simple reporting
-      await supa.from('leads').update({ last_intent: 'photos' }).eq('id', leadId);
 
-      // Owner alert (single path; we only message OWNER_CELL to avoid duplicates)
+      // ---- Secure owner alert: create/reuse token & send single gallery link ----
       if (process.env.OWNER_CELL && process.env.TWILIO_FROM_NUMBER) {
-        const count = mediaUrls.length;
+        let galleryUrlText = '';
+        try {
+          // Try to reuse a valid, unexpired token first
+          const { data: tokRows } = await supa
+            .from('gallery_tokens')
+            .select('token, expires_at')
+            .eq('lead_id', leadId)
+            .gt('expires_at', new Date().toISOString())
+            .order('expires_at', { ascending: false })
+            .limit(1);
+
+          let token;
+          if (tokRows && tokRows.length) {
+            token = tokRows[0].token;
+          } else {
+            const crypto = await import('crypto');
+            token = crypto.randomBytes(16).toString('hex');
+            const expiryDays = +(process.env.GALLERY_TOKEN_DAYS || 7);
+            const expiresAt = new Date(Date.now() + expiryDays*24*60*60*1000).toISOString();
+            await supa.from('gallery_tokens').insert({ lead_id: leadId, token, expires_at: expiresAt });
+          }
+
+          const base = process.env.PUBLIC_BASE_URL || 'https://gr-ai-backend.vercel.app';
+          const galleryUrl = `${base}/photos.html?token=${encodeURIComponent(token)}`;
+          const expiryDays = +(process.env.GALLERY_TOKEN_DAYS || 7);
+          galleryUrlText = `\n${galleryUrl}\n(Expires in ${expiryDays} day${expiryDays>1?'s':''})`;
+        } catch (e) {
+          console.warn('gallery token create/reuse failed:', e?.message || e);
+          galleryUrlText = '';
+        }
+
         const alertText =
-          `Photos in from ${from} (${count}). ` +
-          `Reply with a number 2–8 on the owner line to set hours.`;
+          `Photos in from ${from} (${mediaPaths.length}).${galleryUrlText}\n` +
+          `Reply 2–8 to set hours.`;
+
         try {
           await twilioClient.messages.create({
             from: process.env.TWILIO_FROM_NUMBER,
             to: process.env.OWNER_CELL,
-            body: alertText,
+            body: alertText
           });
-        } catch (_) {}
+        } catch (e) {
+          console.warn('owner alert send failed:', e?.message || e);
+        }
       }
     } else {
-      // Only set qualifying if lead is new/cold; don't override progressed stages
       if (!existingStage || existingStage === 'cold') {
-        await supa.from('leads').update({ stage: 'qualifying' }).eq('id', leadId);
+        await supa.from('leads').update({ stage:'qualifying' }).eq('id', leadId);
       }
     }
 
-    // Ensure an OpenAI thread for this lead
-    let threadId = lead.thread_id;
-    if (!threadId) {
-      const created = await openai('/threads', { method: 'POST', body: JSON.stringify({}) });
-      threadId = created.id;
-      const { error: upLead } = await supa.from('leads').update({ thread_id: threadId }).eq('id', leadId);
-      if (upLead) throw upLead;
+    // ---------- “options” ping to owner (soft signal) ----------
+    const saidOptions = /\boptions?\b/i.test(body || '');
+    if (saidOptions && process.env.OWNER_CELL && process.env.TWILIO_FROM_NUMBER) {
+      try {
+        await twilioClient.messages.create({
+          from: process.env.TWILIO_FROM_NUMBER,
+          to: process.env.OWNER_CELL,
+          body: `Lead ${from} asked for scheduling options. You can follow up or ask me to propose dates.`
+        });
+      } catch (_) {}
     }
 
-    // Append the message for the model
-    if (body) {
-      await openai(`/threads/${threadId}/messages`, {
-        method: 'POST',
-        body: JSON.stringify({ role: 'user', content: body }),
-      });
-    } else if (hasPhotos) {
-      await openai(`/threads/${threadId}/messages`, {
-        method: 'POST',
-        body: JSON.stringify({ role: 'user', content: 'Sent photos of the garage.' }),
-      });
+    // ---------- BRAND-CONTROLLED REPLY (classifier → template) ----------
+    // Decide the current stage for routing
+    const stage = hasPhotos ? 'awaiting_owner_quote' : (existingStage || 'qualifying');
+
+    // If photos arrived, we short-circuit to ack_photos without classifying
+    let intent = hasPhotos ? 'ack_photos' : null;
+
+    if (!intent) {
+      try {
+        const cls = await classifyMessage({ text: body, stage });
+        intent = cls.intent || 'unknown';
+      } catch (_) {
+        intent = 'unknown';
+      }
     }
 
-    // Create a short run (we keep it snappy)
-    const run = await openai(`/threads/${threadId}/runs`, {
-      method: 'POST',
-      body: JSON.stringify({
-        assistant_id: process.env.OPENAI_ASSISTANT_ID,
-        metadata: { phone: from, stage: hasPhotos ? 'awaiting_owner_quote' : (existingStage || 'qualifying') },
-      }),
+    // Compose brand-approved copy
+    const reply = compose(stage, intent, {
+      // vars you might want to inject later
     });
 
-    // Quick poll (<=10s)
-    let status = run;
-    const deadline = Date.now() + 10000;
-    while (['queued', 'in_progress', 'cancelling'].includes(status.status)) {
-      if (Date.now() > deadline) break;
-      await new Promise((r) => setTimeout(r, 800));
-      status = await openai(`/threads/${threadId}/runs/${run.id}`, { method: 'GET' });
-
-      if (status.status === 'requires_action' && status.required_action?.submit_tool_outputs) {
-        const calls = status.required_action.submit_tool_outputs.tool_calls || [];
-        const tool_outputs = calls.map((c) => ({
-          tool_call_id: c.id,
-          output: JSON.stringify({ ok: true, note: 'tool not implemented yet' }),
-        }));
-        await openai(`/threads/${threadId}/runs/${run.id}/submit_tool_outputs`, {
-          method: 'POST',
-          body: JSON.stringify({ tool_outputs }),
-        });
-      }
-    }
-
-    // Get latest assistant message
-    const list = await openai(`/threads/${threadId}/messages?order=desc&limit=1`, { method: 'GET' });
-    const last = list.data?.[0];
-    let reply =
-      last?.content?.[0]?.text?.value ||
-      (hasPhotos
-        ? 'Got your photos—thank you. I’m reviewing them now and will send your time estimate shortly.'
-        : 'Hi—this is Garage Raiders. Two wide photos of your garage is the fastest way to get a precise time estimate.');
-
-    // Clean bracket-style citations
-    reply = reply.replace(/【\d+:\d+†.*?†.*?】/g, '').replace(/\[\d+\]/g, '').replace(/\(source.*?\)/gi, '');
-
-    // Send reply and log outbound
+    // Send reply via Twilio + log
     const sent = await twilioClient.messages.create({
       from: process.env.TWILIO_FROM_NUMBER,
       to: from,
-      body: reply,
+      body: reply
     });
 
     await supa.from('messages').insert({
@@ -215,13 +310,13 @@ export default async function handler(req, res) {
       direction: 'outbound',
       body: reply,
       channel: 'sms',
-      twilio_message_id: sent.sid,
+      twilio_message_id: sent.sid
     });
 
-    return res.status(200).json({ ok: true, leadId, threadId, runId: run.id });
-  } catch (e) {
+    return res.status(200).json({ ok:true, leadId });
+  } catch(e) {
     console.error('Inbound error:', e);
     // Return 200 so Twilio doesn’t hammer retries
-    return res.status(200).json({ ok: false, error: String(e.message || e) });
+    return res.status(200).json({ ok:false, error: String(e.message || e) });
   }
 }
