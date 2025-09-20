@@ -21,6 +21,48 @@ const TEMPLATES = {
   faq: "Yes! We can install ceiling racks, shelves, or even coat your floor with epoxy. Every Garage Raid includes deep cleaning, organizing, and donation drop-off."
 };
 
+// ---------- long customer quote template ----------
+function buildCustomerQuote(hours) {
+  const subtotal = (139 * hours) + 49; // fuel fee
+  const hLabel = `hour${hours > 1 ? 's' : ''}`;
+  return (
+`Hi,
+
+Cristian here with Garage Raiders, thanks for the photos.
+
+Here’s your custom estimate:
+• ${hours} ${hLabel} — $${subtotal} + tax
+\t($139/hr x ${hours} ${hLabel} + $49 fuel)
+• You only pay for the time used, down to the minute.
+
+Included:
+• Full sort, categorization & organization
+• Deep cleaning of the entire space
+• Heavy-duty trash bags
+• Free donation drop-off to any organization
+
+Optional Add-On:
+• Trash haul-away — $249 flat rate (up to 12 cubic yards)
+\tNote: We cannot remove paint, chemicals, TVs, microwaves, or freon appliances.
+
+Storage Upgrades:
+Explore ceiling racks, shelving, and premium storage solutions:
+https://www.garageraiders.com/category/all-products
+
+Helpful Links:
+• Strategy: https://www.garageraiders.com/strategy
+
+• Reviews: https://www.garageraiders.com/reviews
+
+• Pay Online or Book with Klarna/Affirm: https://www.garageraiders.com/Raid${hours}Hours
+
+If you have any questions or you're ready to book, just text or call me directly.
+
+Cristian
+Garage Raiders`
+  );
+}
+
 // ---------- simple intent detector ----------
 function detectIntent(body, hasPhotos) {
   const text = (body || "").toLowerCase();
@@ -163,9 +205,10 @@ export default async function handler(req, res) {
         });
         return res.status(200).json({ ok:false });
       }
-      const quoteText =
-        `Here’s your time estimate for the Garage Raid: ~${hours} hour${hours>1?'s':''} on site for a two-person team.\n\n` +
-        `What day works best? Morning (8–12) or Afternoon (12–3).`;
+
+      // Use your long template
+      const quoteText = buildCustomerQuote(hours);
+
       const sentQuote = await twilioClient.messages.create({
         from: process.env.TWILIO_FROM_NUMBER, to: target.phone, body: quoteText
       });
@@ -173,6 +216,15 @@ export default async function handler(req, res) {
         lead_id: target.id, direction:'outbound', body:quoteText, channel:'sms', twilio_message_id: sentQuote.sid
       });
       await supa.from('leads').update({ stage:'quote_sent' }).eq('id', target.id);
+      try {
+        // Optional: schedule a D+1 follow-up (if you have followups table/cron)
+        await supa.from('followups').insert({
+          lead_id: target.id,
+          due_at: new Date(Date.now() + 24*60*60*1000).toISOString(),
+          kind: 'quote_d1'
+        });
+      } catch(_) {}
+
       await twilioClient.messages.create({
         from: process.env.TWILIO_FROM_NUMBER, to: from,
         body:`Sent ${hours}h estimate to ${target.name||target.phone}.`
@@ -217,7 +269,7 @@ export default async function handler(req, res) {
       }
     }
 
-    // 1) ALWAYS log inbound (so UI sees it)
+    // 1) Log inbound (so UI sees it)
     await supa.from('messages').insert({
       lead_id: leadId,
       direction: 'inbound',
@@ -270,7 +322,7 @@ export default async function handler(req, res) {
       }
     }
 
-    // 3) Template guardrail (now AFTER logging inbound so UI is correct)
+    // 3) Template guardrail after logging inbound
     const intent = detectIntent(body, hasPhotos);
     if (intent && TEMPLATES[intent]) {
       const replyText = TEMPLATES[intent];
@@ -299,8 +351,7 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok:true, leadId, handledBy:"template", intent });
     }
 
-    // 4) Fallback to OpenAI assistant (same as before)
-    // Ensure thread
+    // 4) Fallback to OpenAI assistant
     let threadId = lead.thread_id;
     if (!threadId) {
       const created = await openai('/threads',{ method:'POST', body: JSON.stringify({}) });
@@ -336,7 +387,6 @@ export default async function handler(req, res) {
       }
     }
 
-    // Assistant reply
     const list = await openai(`/threads/${threadId}/messages?order=desc&limit=1`, { method:'GET' });
     const last = list.data?.[0];
     let reply =
@@ -356,7 +406,6 @@ export default async function handler(req, res) {
     return res.status(200).json({ ok:true, leadId, threadId, runId: run.id });
   } catch(e) {
     console.error('Inbound error:', e);
-    // Return 200 so Twilio doesn’t hammer retries
     return res.status(200).json({ ok:false, error: String(e.message || e) });
   }
 }
