@@ -3,12 +3,33 @@ import { createClient } from '@supabase/supabase-js';
 import twilio from 'twilio';
 import { parse as parseQuery } from 'querystring';
 
-// NEW: brand-controlled replies and NLU-only classifier
-import { compose } from '../lib/brand.js';
-import { classifyMessage } from '../lib/nlu.js';
-
 const supa = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
 const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+
+const OA_HEADERS = {
+  Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+  'Content-Type': 'application/json',
+  'OpenAI-Beta': 'assistants=v2',
+};
+
+// ---------- templates ----------
+const TEMPLATES = {
+  photos: "Got your photos, thank you. The team will review and text your estimate shortly.",
+  estimate: "The fastest way is to send a couple photos of your garage. That lets us give you an exact time estimate for your Garage Raid.",
+  options: "We typically typically start at 9:00 AM, but we may have afternoon slots as well. What works best for you?",
+  pricing: "Our Garage Raid service is $139 per hour for a team of two raiders, plus a one-time $49 fuel fee. Once we see your garage photos, we can give you an accurate time estimate.",
+  faq: "Yes! We can install ceiling racks, shelves, or even coat your floor with epoxy. Every Garage Raid includes deep cleaning, organizing, and donation drop-off."
+};
+
+function detectIntent(body, hasPhotos) {
+  const text = (body || "").toLowerCase();
+  if (hasPhotos) return "photos";
+  if (/estimate|get started|quote/.test(text)) return "estimate";
+  if (/options|available|schedule|day|time/.test(text)) return "options";
+  if (/price|cost|how much|rate/.test(text)) return "pricing";
+  if (/rack|shelf|epoxy|clean/.test(text)) return "faq";
+  return null; // fallback → assistant
+}
 
 // ---------- helpers ----------
 async function readRawBody(req) {
@@ -19,7 +40,18 @@ async function readRawBody(req) {
   });
 }
 
-// Validate Twilio signature (production)
+async function openai(path, options = {}) {
+  const res = await fetch(`https://api.openai.com/v1${path}`, {
+    ...options,
+    headers: { ...OA_HEADERS, ...(options.headers || {}) },
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    throw new Error(`OpenAI ${path} failed: ${res.status} ${text}`);
+  }
+  return res.json();
+}
+
 function isValidTwilio(req, paramsObj) {
   const sig = req.headers['x-twilio-signature'];
   const token = process.env.TWILIO_AUTH_TOKEN;
@@ -33,11 +65,10 @@ function normE164(s) {
   if (!digits) return '';
   const d10 = digits.length === 11 && digits.startsWith('1')
     ? digits
-    : (digits.length === 10 ? '1' + digits : digits);
+    : digits.length === 10 ? '1' + digits : digits;
   return `+${d10}`;
 }
 
-// Parse owner command like "6" or "6 +13465551234"
 function detectOwnerHoursAndPhone(text) {
   const t = String(text || '').trim();
   const hm = t.match(/\b([2-8])\b/);
@@ -47,12 +78,10 @@ function detectOwnerHoursAndPhone(text) {
   return { hours, phone };
 }
 
-// Helper: determine if stage is already at/after quote
 function isAtOrAfterQuote(stage) {
   return stage === 'quote_sent' || stage === 'closed_won' || stage === 'closed_lost';
 }
 
-// ---------- Twilio media fetch + upload helpers ----------
 async function fetchTwilioMedia(url) {
   const auth = Buffer.from(
     `${process.env.TWILIO_ACCOUNT_SID}:${process.env.TWILIO_AUTH_TOKEN}`
@@ -70,7 +99,6 @@ function extFromContentType(ct) {
 }
 
 function readableKey(fromE164, i, ext) {
-  // phone folder (no '+'), date folder, timestamp-based filename
   const phoneSafe = String(fromE164 || '').replace('+','');
   const d = new Date();
   const dateFolder = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
@@ -143,16 +171,6 @@ export default async function handler(req, res) {
         lead_id: target.id, direction:'outbound', body:quoteText, channel:'sms', twilio_message_id: sentQuote.sid
       });
       await supa.from('leads').update({ stage:'quote_sent' }).eq('id', target.id);
-
-      // Best-effort D+1 followup row (if you created the table)
-      try {
-        await supa.from('followups').insert({
-          lead_id: target.id,
-          due_at: new Date(Date.now() + 24*60*60*1000).toISOString(),
-          kind: 'quote_d1'
-        });
-      } catch (_) {}
-
       await twilioClient.messages.create({
         from: process.env.TWILIO_FROM_NUMBER, to: from,
         body:`Sent ${hours}h estimate to ${target.name||target.phone}.`
@@ -177,146 +195,80 @@ export default async function handler(req, res) {
     const leadId = lead.id;
     const existingStage = lead.stage || null;
 
-    // Upload photos to private storage; collect storage object KEYS (paths)
-    let mediaPaths = [];
-    if (hasPhotos) {
-      for (let i=0;i<mediaUrls.length;i++) {
-        try {
-          const { nodeBuf, contentType } = await fetchTwilioMedia(mediaUrls[i]);
-          const ext = extFromContentType(contentType);
-          const key = readableKey(from, i, ext);     // e.g. 1737.../2025-09-18/<ts>_0.jpg
-          const up = await supa.storage
-            .from(process.env.INBOUND_BUCKET || 'inbound-mms')
-            .upload(key, nodeBuf, { contentType, upsert:false });
-          if (up.error) throw up.error;
-          mediaPaths.push(key);
-        } catch(e) {
-          console.warn('MMS upload warn:', e?.message || e);
-        }
-      }
+    // --- NEW: template guardrails ---
+    const intent = detectIntent(body, hasPhotos);
+    if (intent && TEMPLATES[intent]) {
+      const reply = TEMPLATES[intent];
+      const sent = await twilioClient.messages.create({
+        from: process.env.TWILIO_FROM_NUMBER,
+        to: from,
+        body: reply
+      });
+      await supa.from('messages').insert({
+        lead_id: leadId, direction:'outbound', body: reply, channel:'sms', twilio_message_id: sent.sid
+      });
+      return res.status(200).json({ ok:true, leadId, handledBy: "template", intent });
     }
 
-    // Store inbound message (note: using media_paths, not public links)
+    // --- if no template match, continue with OpenAI flow ---
+
+    // Store inbound
     await supa.from('messages').insert({
       lead_id: leadId,
       direction: 'inbound',
       body: body || (hasPhotos ? '[Photo(s) received]' : ''),
       channel: 'sms',
-      twilio_message_id: sid || null,
-      media_paths: mediaPaths.length ? mediaPaths : null
+      twilio_message_id: sid || null
     });
 
-    // Stage updates
-    if (hasPhotos) {
-      if (!isAtOrAfterQuote(existingStage) && existingStage!=='awaiting_owner_quote') {
-        await supa.from('leads').update({ stage:'awaiting_owner_quote' }).eq('id', leadId);
-      }
-
-      // ---- Secure owner alert: create/reuse token & send single gallery link ----
-      if (process.env.OWNER_CELL && process.env.TWILIO_FROM_NUMBER) {
-        let galleryUrlText = '';
-        try {
-          // Try to reuse a valid, unexpired token first
-          const { data: tokRows } = await supa
-            .from('gallery_tokens')
-            .select('token, expires_at')
-            .eq('lead_id', leadId)
-            .gt('expires_at', new Date().toISOString())
-            .order('expires_at', { ascending: false })
-            .limit(1);
-
-          let token;
-          if (tokRows && tokRows.length) {
-            token = tokRows[0].token;
-          } else {
-            const crypto = await import('crypto');
-            token = crypto.randomBytes(16).toString('hex');
-            const expiryDays = +(process.env.GALLERY_TOKEN_DAYS || 7);
-            const expiresAt = new Date(Date.now() + expiryDays*24*60*60*1000).toISOString();
-            await supa.from('gallery_tokens').insert({ lead_id: leadId, token, expires_at: expiresAt });
-          }
-
-          const base = process.env.PUBLIC_BASE_URL || 'https://gr-ai-backend.vercel.app';
-          const galleryUrl = `${base}/photos.html?token=${encodeURIComponent(token)}`;
-          const expiryDays = +(process.env.GALLERY_TOKEN_DAYS || 7);
-          galleryUrlText = `\n${galleryUrl}\n(Expires in ${expiryDays} day${expiryDays>1?'s':''})`;
-        } catch (e) {
-          console.warn('gallery token create/reuse failed:', e?.message || e);
-          galleryUrlText = '';
-        }
-
-        const alertText =
-          `Photos in from ${from} (${mediaPaths.length}).${galleryUrlText}\n` +
-          `Reply 2–8 to set hours.`;
-
-        try {
-          await twilioClient.messages.create({
-            from: process.env.TWILIO_FROM_NUMBER,
-            to: process.env.OWNER_CELL,
-            body: alertText
-          });
-        } catch (e) {
-          console.warn('owner alert send failed:', e?.message || e);
-        }
-      }
-    } else {
-      if (!existingStage || existingStage === 'cold') {
-        await supa.from('leads').update({ stage:'qualifying' }).eq('id', leadId);
-      }
+    // Ensure thread
+    let threadId = lead.thread_id;
+    if (!threadId) {
+      const created = await openai('/threads',{ method:'POST', body: JSON.stringify({}) });
+      threadId = created.id;
+      await supa.from('leads').update({ thread_id: threadId }).eq('id', leadId);
     }
-
-    // ---------- “options” ping to owner (soft signal) ----------
-    const saidOptions = /\boptions?\b/i.test(body || '');
-    if (saidOptions && process.env.OWNER_CELL && process.env.TWILIO_FROM_NUMBER) {
-      try {
-        await twilioClient.messages.create({
-          from: process.env.TWILIO_FROM_NUMBER,
-          to: process.env.OWNER_CELL,
-          body: `Lead ${from} asked for scheduling options. You can follow up or ask me to propose dates.`
-        });
-      } catch (_) {}
+    if (body || hasPhotos) {
+      await openai(`/threads/${threadId}/messages`,{
+        method:'POST',
+        body: JSON.stringify({ role:'user', content: body || 'Sent photos of the garage.' })
+      });
     }
-
-    // ---------- BRAND-CONTROLLED REPLY (classifier → template) ----------
-    // Decide the current stage for routing
-    const stage = hasPhotos ? 'awaiting_owner_quote' : (existingStage || 'qualifying');
-
-    // If photos arrived, we short-circuit to ack_photos without classifying
-    let intent = hasPhotos ? 'ack_photos' : null;
-
-    if (!intent) {
-      try {
-        const cls = await classifyMessage({ text: body, stage });
-        intent = cls.intent || 'unknown';
-      } catch (_) {
-        intent = 'unknown';
-      }
-    }
-
-    // Compose brand-approved copy
-    const reply = compose(stage, intent, {
-      // vars you might want to inject later
+    const run = await openai(`/threads/${threadId}/runs`,{
+      method:'POST',
+      body: JSON.stringify({
+        assistant_id: process.env.OPENAI_ASSISTANT_ID,
+        metadata: { phone: from, stage: hasPhotos ? 'awaiting_owner_quote' : (existingStage || 'qualifying') }
+      })
     });
 
-    // Send reply via Twilio + log
+    // Poll short
+    let status = run; const deadline = Date.now() + 10000;
+    while (['queued','in_progress','cancelling'].includes(status.status)) {
+      if (Date.now() > deadline) break;
+      await new Promise(r => setTimeout(r, 800));
+      status = await openai(`/threads/${threadId}/runs/${run.id}`, { method:'GET' });
+    }
+
+    const list = await openai(`/threads/${threadId}/messages?order=desc&limit=1`, { method:'GET' });
+    const last = list.data?.[0];
+    let reply =
+      last?.content?.[0]?.text?.value ||
+      (hasPhotos
+        ? 'Got your photos—thank you. The owner will review and text your estimate shortly.'
+        : 'Hi—this is Garage Raiders. Two wide photos of your garage is the fastest way to get a precise estimate.');
+    reply = reply.replace(/【\d+:\d+†.*?†.*?】/g,'').replace(/\[\d+\]/g,'').replace(/\(source.*?\)/gi,'');
+
     const sent = await twilioClient.messages.create({
-      from: process.env.TWILIO_FROM_NUMBER,
-      to: from,
-      body: reply
+      from: process.env.TWILIO_FROM_NUMBER, to: from, body: reply
     });
-
     await supa.from('messages').insert({
-      lead_id: leadId,
-      direction: 'outbound',
-      body: reply,
-      channel: 'sms',
-      twilio_message_id: sent.sid
+      lead_id: leadId, direction:'outbound', body: reply, channel:'sms', twilio_message_id: sent.sid
     });
 
-    return res.status(200).json({ ok:true, leadId });
+    return res.status(200).json({ ok:true, leadId, threadId, runId: run.id });
   } catch(e) {
     console.error('Inbound error:', e);
-    // Return 200 so Twilio doesn’t hammer retries
     return res.status(200).json({ ok:false, error: String(e.message || e) });
   }
 }
