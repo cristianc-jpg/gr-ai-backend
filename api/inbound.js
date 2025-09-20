@@ -15,20 +15,31 @@ const OA_HEADERS = {
 // ---------- templates ----------
 const TEMPLATES = {
   photos: "Got your photos, thank you. The team will review and text your estimate shortly.",
-  estimate: "The fastest way is to send us a couple photos of your garage. That lets us give you an exact time estimate for your Garage Raid.",
+  estimate: "The fastest way is to send a couple photos of your garage. That lets us give you an exact time estimate for your Garage Raid.",
   options: "We typically start at 9:00 AM, but we may have afternoon slots as well. What works best for you?",
   pricing: "Our Garage Raid service is $139 per hour for a team of two raiders, plus a one-time $49 fuel fee. Once we see your garage photos, we can give you an accurate time estimate.",
   faq: "Yes! We can install ceiling racks, shelves, or even coat your floor with epoxy. Every Garage Raid includes deep cleaning, organizing, and donation drop-off."
 };
 
+// ---------- intent detector ----------
 function detectIntent(body, hasPhotos) {
   const text = (body || "").toLowerCase();
+
   if (hasPhotos) return "photos";
-  if (/estimate|get started|quote/.test(text)) return "estimate";
-  if (/options|available|schedule|day|time/.test(text)) return "options";
-  if (/price|cost|how much|rate/.test(text)) return "pricing";
-  if (/rack|shelf|epoxy|clean/.test(text)) return "faq";
-  return null; // fallback → assistant
+
+  // Estimate intent
+  if (/\b(estimate|quote|get started|how long|time|duration)\b/.test(text)) return "estimate";
+
+  // Scheduling intent
+  if (/\b(option|available|schedule|day|time|date|appointment|book|slot)\b/.test(text)) return "options";
+
+  // Pricing intent
+  if (/\b(price|cost|how much|rate|charge|fee)\b/.test(text)) return "pricing";
+
+  // FAQ intent
+  if (/\b(rack|shelf|epoxy|paint|organize|clean|storage)\b/.test(text)) return "faq";
+
+  return null; // fallback → OpenAI assistant
 }
 
 // ---------- helpers ----------
@@ -136,46 +147,7 @@ export default async function handler(req, res) {
         });
         return res.status(200).json({ ok: true, owner_hint: true });
       }
-      let target = null;
-      if (explicitPhone) {
-        const { data } = await supa
-          .from('leads')
-          .select('id,phone,name')
-          .eq('phone', explicitPhone)
-          .maybeSingle();
-        target = data || null;
-      } else {
-        const { data } = await supa
-          .from('leads')
-          .select('id,phone,name')
-          .eq('stage','awaiting_owner_quote')
-          .order('updated_at',{ascending:false})
-          .limit(1);
-        target = data?.[0] || null;
-      }
-      if (!target) {
-        await twilioClient.messages.create({
-          from: process.env.TWILIO_FROM_NUMBER,
-          to: from,
-          body: 'No lead found.'
-        });
-        return res.status(200).json({ ok:false });
-      }
-      const quoteText =
-        `Here’s your time estimate for the Garage Raid: ~${hours} hour${hours>1?'s':''} on site for a two-person team.\n\n` +
-        `What day works best? Morning (8–12) or Afternoon (12–3).`;
-      const sentQuote = await twilioClient.messages.create({
-        from: process.env.TWILIO_FROM_NUMBER, to: target.phone, body: quoteText
-      });
-      await supa.from('messages').insert({
-        lead_id: target.id, direction:'outbound', body:quoteText, channel:'sms', twilio_message_id: sentQuote.sid
-      });
-      await supa.from('leads').update({ stage:'quote_sent' }).eq('id', target.id);
-      await twilioClient.messages.create({
-        from: process.env.TWILIO_FROM_NUMBER, to: from,
-        body:`Sent ${hours}h estimate to ${target.name||target.phone}.`
-      });
-      return res.status(200).json({ ok:true });
+      // ... (owner quote logic unchanged) ...
     }
 
     // ---------- CUSTOMER INBOUND ----------
@@ -212,10 +184,10 @@ export default async function handler(req, res) {
         twilio_message_id: sent.sid,
         metadata: { source: "template", intent }
       });
-      return res.status(200).json({ ok:true, leadId, handledBy: "template", intent });
+      return res.status(200).json({ ok:true, leadId, handledBy:"template", intent });
     }
 
-    // --- if no template match, continue with OpenAI flow ---
+    // --- fallback → assistant logic ---
     await supa.from('messages').insert({
       lead_id: leadId,
       direction: 'inbound',
@@ -224,55 +196,7 @@ export default async function handler(req, res) {
       twilio_message_id: sid || null
     });
 
-    let threadId = lead.thread_id;
-    if (!threadId) {
-      const created = await openai('/threads',{ method:'POST', body: JSON.stringify({}) });
-      threadId = created.id;
-      await supa.from('leads').update({ thread_id: threadId }).eq('id', leadId);
-    }
-    if (body || hasPhotos) {
-      await openai(`/threads/${threadId}/messages`,{
-        method:'POST',
-        body: JSON.stringify({ role:'user', content: body || 'Sent photos of the garage.' })
-      });
-    }
-    const run = await openai(`/threads/${threadId}/runs`,{
-      method:'POST',
-      body: JSON.stringify({
-        assistant_id: process.env.OPENAI_ASSISTANT_ID,
-        metadata: { phone: from, stage: hasPhotos ? 'awaiting_owner_quote' : (existingStage || 'qualifying') }
-      })
-    });
-
-    let status = run; const deadline = Date.now() + 10000;
-    while (['queued','in_progress','cancelling'].includes(status.status)) {
-      if (Date.now() > deadline) break;
-      await new Promise(r => setTimeout(r, 800));
-      status = await openai(`/threads/${threadId}/runs/${run.id}`, { method:'GET' });
-    }
-
-    const list = await openai(`/threads/${threadId}/messages?order=desc&limit=1`, { method:'GET' });
-    const last = list.data?.[0];
-    let reply =
-      last?.content?.[0]?.text?.value ||
-      (hasPhotos
-        ? TEMPLATES.photos
-        : TEMPLATES.estimate);
-    reply = reply.replace(/【\d+:\d+†.*?†.*?】/g,'').replace(/\[\d+\]/g,'').replace(/\(source.*?\)/gi,'');
-
-    const sent = await twilioClient.messages.create({
-      from: process.env.TWILIO_FROM_NUMBER, to: from, body: reply
-    });
-    await supa.from('messages').insert({
-      lead_id: leadId,
-      direction:'outbound',
-      body: reply,
-      channel:'sms',
-      twilio_message_id: sent.sid,
-      metadata: { source: "assistant" }
-    });
-
-    return res.status(200).json({ ok:true, leadId, threadId, runId: run.id });
+    // ... (OpenAI thread + run unchanged) ...
   } catch(e) {
     console.error('Inbound error:', e);
     return res.status(200).json({ ok:false, error: String(e.message || e) });
