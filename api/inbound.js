@@ -16,7 +16,7 @@ const OA_HEADERS = {
 const TEMPLATES = {
   photos: "Got your photos, thank you. The team will review and text your estimate shortly.",
   estimate: "The fastest way is to send a couple photos of your garage. That lets us give you an exact time estimate for your Garage Raid.",
-  options: "We typically typically start at 9:00 AM, but we may have afternoon slots as well. What works best for you?",
+  options: "We typically start at 9:00 AM, but we may have afternoon slots as well. What works best for you?",
   pricing: "Our Garage Raid service is $139 per hour for a team of two raiders, plus a one-time $49 fuel fee. Once we see your garage photos, we can give you an accurate time estimate.",
   faq: "Yes! We can install ceiling racks, shelves, or even coat your floor with epoxy. Every Garage Raid includes deep cleaning, organizing, and donation drop-off."
 };
@@ -43,18 +43,6 @@ async function readRawBody(req) {
   });
 }
 
-async function openai(path, options = {}) {
-  const res = await fetch(`https://api.openai.com/v1${path}`, {
-    ...options,
-    headers: { ...OA_HEADERS, ...(options.headers || {}) },
-  });
-  if (!res.ok) {
-    const text = await res.text().catch(() => '');
-    throw new Error(`OpenAI ${path} failed: ${res.status} ${text}`);
-  }
-  return res.json();
-}
-
 function isValidTwilio(req, paramsObj) {
   const sig = req.headers['x-twilio-signature'];
   const token = process.env.TWILIO_AUTH_TOKEN;
@@ -70,19 +58,6 @@ function normE164(s) {
     ? digits
     : digits.length === 10 ? '1' + digits : digits;
   return `+${d10}`;
-}
-
-function detectOwnerHoursAndPhone(text) {
-  const t = String(text || '').trim();
-  const hm = t.match(/\b([2-8])\b/);
-  const hours = hm ? parseInt(hm[1], 10) : null;
-  const pm = t.match(/(\+?1?\D?\d{3}\D?\d{3}\D?\d{4})/);
-  const phone = pm ? normE164(pm[1]) : null;
-  return { hours, phone };
-}
-
-function isAtOrAfterQuote(stage) {
-  return stage === 'quote_sent' || stage === 'closed_won' || stage === 'closed_lost';
 }
 
 // ---------- main ----------
@@ -111,6 +86,7 @@ export default async function handler(req, res) {
     }
     const hasPhotos = mediaUrls.length>0;
 
+    // Upsert lead
     const { data: lead } = await supa
       .from('leads')
       .upsert({ phone: from },{onConflict:'phone'})
@@ -118,6 +94,7 @@ export default async function handler(req, res) {
       .single();
 
     const leadId = lead.id;
+    const existingStage = lead.stage || 'cold';
 
     // --- NEW: template guardrails ---
     const intent = detectIntent(body, hasPhotos);
@@ -128,6 +105,7 @@ export default async function handler(req, res) {
         to: from,
         body: reply
       });
+
       await supa.from('messages').insert({
         lead_id: leadId,
         direction:'outbound',
@@ -136,12 +114,17 @@ export default async function handler(req, res) {
         twilio_message_id: sent.sid,
         metadata: { source: "template", intent }
       });
-      // 🔹 also log to leads table
-      await supa.from('leads').update({ last_intent: intent }).eq('id', leadId);
+
+      // 🔹 update lead with last_intent + stage
+      await supa.from('leads').update({
+        last_intent: intent,
+        stage: hasPhotos ? 'awaiting_owner_quote' : (existingStage === 'cold' ? 'qualifying' : existingStage)
+      }).eq('id', leadId);
+
       return res.status(200).json({ ok:true, leadId, handledBy:"template", intent });
     }
 
-    // --- fallback → assistant logic ---
+    // --- fallback: log inbound message ---
     await supa.from('messages').insert({
       lead_id: leadId,
       direction: 'inbound',
@@ -150,7 +133,13 @@ export default async function handler(req, res) {
       twilio_message_id: sid || null
     });
 
-    // … (OpenAI fallback as before) …
+    // default stage update
+    if (hasPhotos && existingStage !== 'quote_sent') {
+      await supa.from('leads').update({ stage: 'awaiting_owner_quote' }).eq('id', leadId);
+    } else if (!hasPhotos && existingStage === 'cold') {
+      await supa.from('leads').update({ stage: 'qualifying' }).eq('id', leadId);
+    }
+
     return res.status(200).json({ ok:true, leadId, handledBy:"assistant" });
   } catch(e) {
     console.error('Inbound error:', e);
