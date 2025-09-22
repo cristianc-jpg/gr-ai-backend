@@ -1,3 +1,11 @@
+import { getClient } from '../../garage-raiders-worker/client';
+
+const client = await getClient();
+await client.workflow.start('leadWorkflow', {
+  args: [fromPhone],
+  taskQueue: 'sms-orchestrator',
+  workflowId: `lead-${fromPhone}`,
+});
 // api/inbound.js
 import { createClient } from '@supabase/supabase-js';
 import twilio from 'twilio';
